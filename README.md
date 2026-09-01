@@ -4,7 +4,8 @@
 
 🌐 **Официальный сайт проекта:** [https://storm-browser.ru/](https://storm-browser.ru/)
 
-![StormBrowser Screenshot](ссылка_на_ваш_красивый_скриншот.png) 
+<img width="800" height="800" alt="10" src="https://github.com/user-attachments/assets/a180a21b-a2aa-4e81-872d-d3eec420f2b1" />
+
 
 ## 📥 Скачать браузер (Для обычных пользователей)
 Готовый установщик всегда доступен для загрузки:
