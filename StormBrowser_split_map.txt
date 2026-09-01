@@ -1,0 +1,127 @@
+====================================================================
+StormBrowser — карта разбиения MainWindow.cpp и Pagetemplates.cpp
+====================================================================
+Справка на будущее: где теперь искать код, если раньше он лежал в
+одном из двух самых больших файлов проекта.
+
+Публичные интерфейсы классов (MainWindow.h, PageTemplates.h) НЕ
+менялись — остальной код проекта их не заметит.
+
+
+--------------------------------------------------------------------
+1. MainWindow.cpp (было 2451 строка) -> 8 файлов
+--------------------------------------------------------------------
+
+MainWindow.cpp (ядро, ~900 строк)
+    Конструктор, деструктор, setupUi() — вся сборка интерфейса окна
+    (тулбар, вкладки, сайдбар, панель закладок и т.п.), closeEvent.
+    Плюс классы-фильтры событий, которые нужны только внутри setupUi():
+    TabPreviewPopup, TabHoverFilter, StormTabMimeData, TabDragDropFilter,
+    StormTabWidget, DownloadsPanelVisibilityFilter.
+
+MainWindow_UiHelpers.h (общий internal-заголовок)
+    Два служебных класса/функции, которые нужны сразу двум файлам:
+    - WindowDragFilter  (используется и в setupUi, и в showHistory)
+    - applyMediaCodecFix (используется и в setupUi, и в addNewTab)
+
+MainWindow_Navigation.cpp
+    Навигация и панель поиска по странице:
+    navigateToUrl, goBack, goForward, reloadPage, stopLoading, goHome,
+    showFindBar / hideFindBar / performFindBarSearch / findNext /
+    findPrevious, updateAddressBar.
+
+MainWindow_Tabs.cpp
+    Всё про вкладки: addNewTab, closeTab, showTabContextMenu,
+    setTabCategory, groupTabsByCategory, detachTab / attachTab
+    (перенос вкладки между окнами), importTabs / exportTabs /
+    openImportedTabs.
+
+MainWindow_Bookmarks.cpp
+    Закладки и история: loadBookmarksIntoMenu, isCurrentPageBookmarked,
+    addCurrentBookmark, removeCurrentBookmark, clearBookmarks,
+    showHistory, clearHistory, toggleBookmarksBar, openBookmarksTab.
+
+MainWindow_Passwords.cpp
+    Менеджер паролей: showPasswordManager, changeMasterPassword,
+    resetPasswordVault, importPasswords, showSavePasswordPrompt.
+
+MainWindow_Settings.cpp
+    Настройки, тема, Storm Shield: openSettingsTab, showStartupSettings,
+    setSearchEngine, setUiLanguage, setNewTabBackground,
+    setAsDefaultBrowser, clearBrowserData, applyTheme,
+    isCurrentPageShieldExcepted, toggleShieldException,
+    updateShieldStatusIndicator.
+
+MainWindow_View.cpp
+    Вид страницы и боковая панель: addFavorite / removeFavorite /
+    clearFavorites, zoomIn / zoomOut / getCurrentZoomString,
+    toggleFullScreen, printCurrentPage, takeScreenshot, openDownloads,
+    openProfile, translateCurrentPage, toggleReaderMode, toggleSidebar,
+    toggleAIPanel, processAiAction, openIncognitoTab.
+
+
+--------------------------------------------------------------------
+2. Pagetemplates.cpp (было 3688 строк) -> 6 файлов + 1 заголовок
+--------------------------------------------------------------------
+Файл целиком состоял из HTML/CSS/JS-шаблонов внутренних страниц
+браузера (storm://...). Два самых больших шаблона (Cloud и Talk)
+физически разрезаны пополам ровно по границе текста внутри строкового
+литерала — сам HTML/CSS/JS не менялся ни на символ, просто раньше был
+один большой QString, теперь он собирается из двух половин через '+'.
+
+PageTemplates.cpp (ядро, ~270 строк)
+    Конструктор класса + небольшие шаблоны:
+    getSettingsHtml()   — storm://settings (делегирует в SettingsPageHtml)
+    getNewTabHtml()     — storm://newtab
+    getIncognitoHtml()  — страница инкогнито-режима
+    getArcadeGameHtml() — обёртка вокруг .swf-игр (Arcade)
+
+PageTemplates_Internal.h (общий internal-заголовок)
+    Объявления функций-половинок шаблонов Cloud и Talk, чтобы
+    getStormCloudHtml()/getTalkHtml() могли их склеить.
+
+PageTemplates_Home.cpp
+    getHomePageHtml() — главная страница storm://home (приветствие,
+    статистика заблокированных угроз, быстрые ссылки/избранное).
+    Не разрезался — размер и так был приемлемый (738 строк).
+
+PageTemplates_Cloud.cpp
+    getStormCloudHtml() — обёртка: чтение настроек синхронизации,
+    склейка двух частей шаблона Storm Cloud + подстановка значений
+    через .replace(...). Плюс сама 1-я половина текста шаблона
+    (buildStormCloudHtmlPart1()).
+
+PageTemplates_Cloud2.cpp
+    2-я половина текста шаблона Storm Cloud (buildStormCloudHtmlPart2()) —
+    прямое продолжение PageTemplates_Cloud.cpp.
+
+PageTemplates_Talk.cpp
+    getTalkHtml() — обёртка, склеивающая две половины шаблона Storm Talk
+    (в отличие от Cloud, здесь нет .replace — шаблон статический).
+    Плюс сама 1-я половина текста (buildTalkHtmlPart1()).
+
+PageTemplates_Talk2.cpp
+    2-я половина текста шаблона Storm Talk (buildTalkHtmlPart2()) —
+    прямое продолжение PageTemplates_Talk.cpp.
+    Здесь же лежат настройки сигнального/TURN-сервера
+    (SIGNALING_HOST, TURN-адрес, ws/wss) — если снова понадобится
+    менять адрес сервера или протокол, искать здесь.
+
+
+--------------------------------------------------------------------
+Памятка: куда лезть, если...
+--------------------------------------------------------------------
+...добавляю новую вкладку или меняю drag&drop вкладок  -> MainWindow_Tabs.cpp
+...правлю адресную строку / поиск по странице (Ctrl+F) -> MainWindow_Navigation.cpp
+...добавляю закладку / правлю историю                  -> MainWindow_Bookmarks.cpp
+...меняю логику паролей                                -> MainWindow_Passwords.cpp
+...добавляю пункт в настройки / меняю тему              -> MainWindow_Settings.cpp
+...зум, скриншот, печать, боковая панель                -> MainWindow_View.cpp
+...меняю сборку интерфейса окна целиком                 -> MainWindow.cpp
+
+...правлю HTML/CSS/JS страницы storm://home             -> PageTemplates_Home.cpp
+...правлю storm://cloud (первая половина текста)         -> PageTemplates_Cloud.cpp
+...правлю storm://cloud (вторая половина текста)         -> PageTemplates_Cloud2.cpp
+...правлю storm://talk  (первая половина текста)         -> PageTemplates_Talk.cpp
+...правлю storm://talk  (вторая половина, сервер связи)  -> PageTemplates_Talk2.cpp
+...storm://settings, storm://newtab, инкогнито, Arcade   -> PageTemplates.cpp

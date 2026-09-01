@@ -1,0 +1,8 @@
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/">
+    <file>logo.png</file>
+    <file>resources/bg.jpg</file>
+    <file>certs/russian_trusted_root_ca.pem</file>
+    <file>certs/russian_trusted_sub_ca.pem</file>
+</qresource>
+</RCC>
