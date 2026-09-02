@@ -889,9 +889,17 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     UpdateManager* updater = this->findChild<UpdateManager*>("UpdateManager");
     if (updater && updater->isUpdateStaged()) {
         qDebug() << "🔄 Запуск установки скачанного обновления перед выходом...";
-        updater->applyStagedUpdateAndRestart();
-        event->ignore();
-        return;
+        // applyStagedUpdateAndRestart() теперь возвращает false, если
+        // обновление на самом деле не запустилось (например, скачанный
+        // установщик оказался повреждён — не совпал хэш). Раньше в этом
+        // редком случае мы всё равно безусловно "проглатывали" закрытие
+        // окна (event->ignore()), и пользователю приходилось нажимать
+        // крестик второй раз без какого-либо объяснения. Теперь при
+        // неудаче просто продолжаем закрываться как обычно, без апдейта.
+        if (updater->applyStagedUpdateAndRestart()) {
+            event->ignore();
+            return;
+        }
     }
 
     // Сворачивание в трей вместо закрытия — только для главного окна

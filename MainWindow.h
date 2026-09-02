@@ -70,6 +70,7 @@ public:
     void openDevTools(QWebEngineView* view, bool forceShow = true);
     void inspectElementAt(QWebEngineView* view);
     void blockElementAt(QWebEngineView* view, const QPoint& pos);
+    void forceQuitForUpdate() { m_isQuitting = true; }
 
 public slots:
     void navigateToUrl();

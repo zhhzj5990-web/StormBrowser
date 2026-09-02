@@ -9,6 +9,8 @@
 #include <QDir>
 #include <QFile>
 #include <QStandardPaths>
+#include <QProcess>
+#include "UpdateManager.h"
 
 int main(int argc, char* argv[])
 {
@@ -144,19 +146,46 @@ int main(int argc, char* argv[])
     const QString dictPath = QCoreApplication::applicationDirPath() + "/qtwebengine_dictionaries";
     qputenv("QTWEBENGINE_DICTIONARIES_PATH", dictPath.toUtf8());
 
-    MainWindow window;
-    window.showMaximized();
+    int exitCode = 0;
+    {
+        MainWindow window;
+        window.showMaximized();
 
-    // Второй запуск (после проверки выше) молча "стучится" в этот процесс
-    // через QLocalSocket — по этому сигналу поднимаем уже открытое окно
-    // наверх, вместо того чтобы просто игнорировать попытку.
-    QObject::connect(&instanceGuard, &SingleInstanceGuard::anotherInstanceStarted, &window, [&window]() {
-        if (window.isMinimized()) {
-            window.showNormal();
-        }
-        window.raise();
-        window.activateWindow();
-        });
+        // Второй запуск (после проверки выше) молча "стучится" в этот процесс
+        // через QLocalSocket — по этому сигналу поднимаем уже открытое окно
+        // наверх, вместо того чтобы просто игнорировать попытку.
+        QObject::connect(&instanceGuard, &SingleInstanceGuard::anotherInstanceStarted, &window, [&window]() {
+            if (window.isMinimized()) {
+                window.showNormal();
+            }
+            window.raise();
+            window.activateWindow();
+            });
 
-    return app.exec();
+        exitCode = app.exec();
+        // 'window' и все её дети (вкладки/QWebEngineView, WebEngine-профиль)
+        // ещё существуют как C++-объекты вплоть до конца этого блока { } —
+        // ниже это гарантирует, что они будут ПОЛНОСТЬЮ разрушены обычным
+        // выходом из области видимости ДО того, как мы позволим отложенному
+        // установщику обновления что-либо трогать на диске.
+    }
+
+    // =================================================================
+    // Отложенный запуск установщика фонового автообновления (если он был).
+    // См. UpdateManager::cleanShutdownAndRunInstaller() — раньше установщик
+    // запускался, пока браузер (и его Chromium-подпроцессы) были ещё
+    // частично живы, и сам жёстко "убивал" ещё не остановленный процесс
+    // (taskkill /F + CloseApplications=force в storm_browser_setup.iss) —
+    // это и вызывало крэш вместо тихого обновления. Теперь установщик
+    // запускается только здесь, когда MainWindow (и все detach-окна) уже
+    // гарантированно разрушены строкой выше — устанавливать поверх себя
+    // больше нечего принудительно закрывать.
+    // =================================================================
+    QString pendingInstallerPath;
+    QStringList pendingInstallerArgs;
+    if (UpdateManager::takePendingInstaller(pendingInstallerPath, pendingInstallerArgs)) {
+        QProcess::startDetached(pendingInstallerPath, pendingInstallerArgs);
+    }
+
+    return exitCode;
 }

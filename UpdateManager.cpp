@@ -12,12 +12,14 @@
 #include <QProcess>
 #include <QApplication>
 #include <QTimer>
+#include <QEvent>
 #include <QDir>
 #include <QDebug>
 #include <QSettings>
 #include <QDateTime>
 #include <QPointer>
 #include <QLockFile>
+#include "MainWindow.h"
 
 UpdateInfoDialog::UpdateInfoDialog(QWidget* parent, const QString& currentVer, const QString& newVer, const QString& changelog)
     : QDialog(parent)
@@ -60,13 +62,16 @@ UpdateInfoDialog::UpdateInfoDialog(QWidget* parent, const QString& currentVer, c
     layout->addLayout(btnLayout);
 }
 
+QString UpdateManager::s_pendingInstallerPath;
+QStringList UpdateManager::s_pendingInstallerArgs;
+
 UpdateManager::UpdateManager(QObject* parent)
     : QObject(parent), currentReply(nullptr), progressDialog(nullptr), tempFile(nullptr),
     sha256Hasher(nullptr), parentWindow(nullptr), isSilentMode(false), updateReadyToInstall(false),
     operationInProgress(false)
 {
     netManager = new QNetworkAccessManager(this);
-    netManager->setProxy(QNetworkProxy::NoProxy); 
+    netManager->setProxy(QNetworkProxy::NoProxy);
 }
 
 bool UpdateManager::isVersionNewer(const QString& remoteVersion, const QString& localVersion) {
@@ -80,12 +85,21 @@ bool UpdateManager::isVersionNewer(const QString& remoteVersion, const QString& 
         int l = i < localParts.size() ? localParts[i].toInt() : 0;
 
         if (!remoteOk) {
-            
+
             return false;
         }
         if (r != l) return r > l;
     }
     return false; // версии полностью совпали
+}
+
+bool UpdateManager::takePendingInstaller(QString& outPath, QStringList& outArgs) {
+    if (s_pendingInstallerPath.isEmpty()) return false;
+    outPath = s_pendingInstallerPath;
+    outArgs = s_pendingInstallerArgs;
+    s_pendingInstallerPath.clear();
+    s_pendingInstallerArgs.clear();
+    return true;
 }
 
 UpdateManager::~UpdateManager() {
@@ -94,7 +108,7 @@ UpdateManager::~UpdateManager() {
         delete tempFile;
     }
     if (sha256Hasher) delete sha256Hasher;
-    
+
     if (updateLockFile) {
         updateLockFile->unlock();
         delete updateLockFile;
@@ -103,7 +117,7 @@ UpdateManager::~UpdateManager() {
 
 // 1. Ручной запуск (по кнопке в меню)
 void UpdateManager::checkForUpdatesManual(QWidget* parentWidget) {
-    
+
     if (updateReadyToInstall) {
         parentWindow = parentWidget;
         auto reply = QMessageBox::question(parentWindow, u8"Обновление готово",
@@ -134,7 +148,7 @@ void UpdateManager::checkForUpdatesManual(QWidget* parentWidget) {
 
 // 2. Тихий запуск (при старте браузера)
 void UpdateManager::startSilentBackgroundCheck() {
-    
+
     if (updateReadyToInstall || operationInProgress) {
         return;
     }
@@ -151,7 +165,7 @@ void UpdateManager::startSilentBackgroundCheck() {
 }
 
 void UpdateManager::startPeriodicChecks() {
-    
+
     QTimer::singleShot(30000, this, &UpdateManager::performScheduledCheck);
 
     if (!periodicCheckTimer) {
@@ -186,7 +200,7 @@ void UpdateManager::onVersionCheckFinished() {
         }
         return;
     }
-    
+
     QSettings().setValue("update/last_check_utc", QDateTime::currentDateTimeUtc());
 
     QJsonDocument jsonDoc = QJsonDocument::fromJson(reply->readAll());
@@ -265,7 +279,7 @@ void UpdateManager::startDownload(const QString& urlStr, const QString& expected
 
     tempFile = new QFile(installerPath);
     if (!tempFile->open(QIODevice::WriteOnly)) {
-        delete tempFile; 
+        delete tempFile;
         tempFile = nullptr;
         if (updateLockFile) { // не оставляем блокировку висеть при неудачном старте закачки
             updateLockFile->unlock();
@@ -293,7 +307,7 @@ void UpdateManager::startDownload(const QString& urlStr, const QString& expected
     currentReply = netManager->get(QNetworkRequest(finalUrl));
 
     if (progressDialog) {
-        
+
         QPointer<QProgressDialog> dlgPtr(progressDialog);
         connect(currentReply, &QNetworkReply::downloadProgress, this,
             [dlgPtr](qint64 bytesReceived, qint64 bytesTotal) {
@@ -316,7 +330,7 @@ void UpdateManager::onReadyRead() {
     QByteArray chunk = currentReply->readAll();
     qint64 written = tempFile->write(chunk);
     if (written != chunk.size()) {
-        
+
         qWarning() << "[Storm Updater] Ошибка записи файла обновления на диск:" << tempFile->errorString();
         diskWriteError = true;
         currentReply->abort();
@@ -363,7 +377,7 @@ void UpdateManager::onDownloadFinished() {
 
     if (finishedReply->error() == QNetworkReply::OperationCanceledError) {
         if (QFile::exists(installerPath)) QFile::remove(installerPath);
-        
+
         bool wasDiskError = diskWriteError;
         cleanupDownloadState();
         operationInProgress = false;
@@ -401,7 +415,7 @@ void UpdateManager::onDownloadFinished() {
     operationInProgress = false;
 
     if (isSilentMode) {
-        
+
         emit updateStagedAndReady(stagedVersion);
     }
     else {
@@ -415,15 +429,15 @@ void UpdateManager::onDownloadFinished() {
     }
 }
 
-void UpdateManager::applyStagedUpdateAndRestart() {
-    if (!updateReadyToInstall || installerPath.isEmpty()) return;
+bool UpdateManager::applyStagedUpdateAndRestart() {
+    if (!updateReadyToInstall || installerPath.isEmpty()) return false;
 
     updateReadyToInstall = false; // в любом случае — одноразовая попытка установки
 
     QFile file(installerPath);
     if (!file.open(QIODevice::ReadOnly)) {
         qWarning() << "[Storm Updater] Не удалось открыть скачанный установщик перед запуском.";
-        return;
+        return false;
     }
     QCryptographicHash verifyHasher(QCryptographicHash::Sha256);
     bool hashed = verifyHasher.addData(&file);
@@ -433,10 +447,11 @@ void UpdateManager::applyStagedUpdateAndRestart() {
     if (targetHash.isEmpty() || actualHash != targetHash) {
         qWarning() << "[Storm Updater] Хэш установщика перед запуском не совпал — установка отменена.";
         QFile::remove(installerPath);
-        return;
+        return false;
     }
 
     cleanShutdownAndRunInstaller(installerPath);
+    return true;
 }
 
 void UpdateManager::cleanShutdownAndRunInstaller(const QString& filePath) {
@@ -450,9 +465,63 @@ void UpdateManager::cleanShutdownAndRunInstaller(const QString& filePath) {
         << "/CLOSEAPPLICATIONS"
         << "/FORCECLOSEAPPLICATIONS";
 
-    // Запускаем сам установщик напрямую (Qt 6 корректно передаст пути с пробелами)
-    QProcess::startDetached(nativePath, args);
+    // -----------------------------------------------------------------
+    // ПОЧЕМУ ОБНОВЛЕНИЕ ПАДАЛО:
+    // Раньше установщик запускался ПРЯМО ЗДЕСЬ (QProcess::startDetached),
+    // а сам браузер закрывался лишь 100 мс спустя голым qApp->quit() — то
+    // есть StormBrowser.exe оставался живым (с открытыми вкладками и всеми
+    // Chromium/QtWebEngine подпроцессами) в момент запуска установщика.
+    // А установщик (см. storm_browser_setup.iss) одновременно САМ жёстко
+    // "убивает" StormBrowser.exe — и через флаги /CLOSEAPPLICATIONS
+    // /FORCECLOSEAPPLICATIONS, и безусловным taskkill /F в своём
+    // InitializeSetup — причём делает это почти мгновенно после старта,
+    // без какого-либо ожидания. Получалась гонка: установщик почти всегда
+    // успевал форсированно "прибить" ещё не остановленный процесс раньше,
+    // чем тот сам корректно завершал WebEngine — отсюда крэш вместо тихого
+    // обновления (а в худшем случае VERYSILENT-установка могла тихо
+    // провалиться на файле, ещё занятом не до конца убитым
+    // QtWebEngineProcess.exe).
+    //
+    // ИСПРАВЛЕНИЕ: установщик здесь больше НЕ запускается. Путь и аргументы
+    // откладываются в статики (переживают уничтожение и этого объекта, и
+    // MainWindow — оба погибнут вместе с закрытием окна), а реальный запуск
+    // происходит из main() ОДИН РАЗ, уже ПОСЛЕ того, как MainWindow и все
+    // detach-окна гарантированно разрушены обычным выходом из области
+    // видимости (см. UpdateManager::takePendingInstaller()). К этому моменту
+    // все QWebEngineView/QWebEngineProfile уже корректно остановлены самим
+    // Qt, и установщику ничего принудительно закрывать не приходится —
+    // CLOSEAPPLICATIONS/taskkill остаются только подстраховкой на случай
+    // залипшего постороннего процесса, а не основным механизмом закрытия.
+    // -----------------------------------------------------------------
+    s_pendingInstallerPath = nativePath;
+    s_pendingInstallerArgs = args;
 
-    // Даем сигнал приложению на завершение работы
-    QTimer::singleShot(100, []() { qApp->quit(); });
+    if (MainWindow* mainWindow = qobject_cast<MainWindow*>(parent())) {
+        mainWindow->forceQuitForUpdate();
+    }
+
+    // QTimer::singleShot(0, ...) — переносим фактическое закрытие окон на
+    // следующую итерацию цикла событий (не следующий кадр по времени, а
+    // буквально "как только сейчас освободится стек"). Это важно:
+    // cleanShutdownAndRunInstaller() иногда вызывается СИНХРОННО изнутри
+    // MainWindow::closeEvent() самого этого окна (когда пользователь
+    // закрывает окно, пока обновление уже готово к установке) — вызови мы
+    // QApplication::closeAllWindows() прямо отсюда, closeEvent() отработал
+    // бы ПОВТОРНО и вложенно, посреди ещё не завершившегося первого вызова.
+    // singleShot(0, ...) сначала спокойно даёт текущему closeEvent()
+    // вернуться, и уже потом, на чистом стеке, закрывает все окна.
+    QTimer::singleShot(0, []() {
+        // Закрываем (и, для detach-окон с Qt::WA_DeleteOnClose, сразу
+        // удаляем) все окна: это также штатно прогоняет
+        // MainWindow::closeEvent() — сохранение сессии открытых вкладок
+        // и т.д. — вместо того, чтобы этот путь молча пропускался при
+        // "тихом" перезапуске на обновление, как было раньше.
+        QApplication::closeAllWindows();
+        // Даём циклу событий обработать отложенные deleteLater() у только
+        // что закрытых detach-окон (WA_DeleteOnClose), пока цикл событий
+        // ещё выполняется — чтобы их QWebEngineView тоже точно успели
+        // разрушиться до выхода из app.exec().
+        QApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        qApp->quit();
+        });
 }

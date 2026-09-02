@@ -230,13 +230,12 @@ target_link_libraries(StormBrowser PRIVATE
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/resources 
      DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
-# Запускаем windeployqt для нашего экзешника после сборки
-add_custom_command(TARGET StormBrowser POST_BUILD
-    COMMAND ${WINDEPLOYQT_EXECUTABLE} 
-            --no-system-d3d-compiler 
-            "$<TARGET_FILE:StormBrowser>"
-    COMMENT "Running windeployqt to copy Qt WebEngine dependencies..."
-)
+# (Здесь раньше был первый вызов windeployqt — удалён: он использовал
+# ${WINDEPLOYQT_EXECUTABLE} ДО find_program(WINDEPLOYQT_EXECUTABLE ...)
+# ниже по файлу, то есть на этапе конфигурации CMake переменная ещё была
+# пустой, и каждая сборка гоняла COMMAND без имени программы. Реальный,
+# рабочий вызов windeployqt — ниже, после find_program(), с флагом
+# --no-translations.)
 
 # Автоматическое копирование папки system_core в папку с готовым исполняемым файлом
 add_custom_command(TARGET StormBrowser POST_BUILD
@@ -279,4 +278,17 @@ add_custom_command(TARGET StormBrowser POST_BUILD
             --no-system-d3d-compiler 
             "$<TARGET_FILE:StormBrowser>"
     COMMENT "Running windeployqt to copy Qt WebEngine dependencies..."
+
+
+)
+
+# 3. Копируем библиотеки OpenSSL для корректной работы HTTPS
+add_custom_command(TARGET StormBrowser POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "D:/Programs/Qt/6.9.3/msvc2022_64/bin/libcrypto-3-x64.dll"
+    "$<TARGET_FILE_DIR:StormBrowser>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "D:/Programs/Qt/6.9.3/msvc2022_64/bin/libssl-3-x64.dll"
+    "$<TARGET_FILE_DIR:StormBrowser>"
+    COMMENT "Копирование библиотек OpenSSL..."
 )

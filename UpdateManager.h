@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QCryptographicHash>
 #include <QTimer>
+#include <QStringList>
 
 class QLockFile;
 
@@ -34,10 +35,24 @@ public:
     // Идёт ли сейчас проверка версии или загрузка (защита от повторного запуска)?
     bool isBusy() const { return operationInProgress; }
 
-    // Запустить установщик при закрытии браузера
-    void applyStagedUpdateAndRestart();
+    // Запустить установщик при закрытии браузера. Возвращает true, только
+    // если реально запущена процедура чистого завершения + отложенного
+    // запуска установщика (см. cleanShutdownAndRunInstaller) — false, если
+    // обновление на самом деле не было готово или файл установщика оказался
+    // повреждён (не совпал хэш). MainWindow::closeEvent() использует этот
+    // результат, чтобы не "проглатывать" закрытие окна впустую, если
+    // обновление на самом деле не запустилось.
+    bool applyStagedUpdateAndRestart();
 
     static bool isVersionNewer(const QString& remoteVersion, const QString& localVersion);
+
+    // Забирает путь и аргументы установщика, отложенные до полного и чистого
+    // завершения процесса браузера (см. cleanShutdownAndRunInstaller()).
+    // main() вызывает это РОВНО ОДИН РАЗ, уже после того как MainWindow (и
+    // все detach-окна) гарантированно разрушены обычным выходом из области
+    // видимости — только тогда безопасно запускать установщик. Возвращает
+    // true и очищает статики, если отложенный запуск действительно есть.
+    static bool takePendingInstaller(QString& outPath, QStringList& outArgs);
 
 signals:
     // Сигнал, чтобы главное окно могло зажечь зеленую иконку или показать уведомление в меню
@@ -82,4 +97,11 @@ private:
     const QString BROWSER_VERSION = "1.2.4";
 
     const QString UPDATE_SERVER_URL = "https://storm-browser.online:8002";
+
+    // Статики (не члены экземпляра!) — переживают уничтожение и этого
+    // UpdateManager, и его владельца MainWindow, которые умирают вместе с
+    // закрытием окна ДО того, как main() успевает забрать отложенный путь
+    // установщика. См. cleanShutdownAndRunInstaller() и takePendingInstaller().
+    static QString s_pendingInstallerPath;
+    static QStringList s_pendingInstallerArgs;
 };
