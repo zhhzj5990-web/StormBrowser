@@ -94,7 +94,7 @@ private:
 
     bool diskWriteError = false;
 
-    const QString BROWSER_VERSION = "1.2.4";
+    const QString BROWSER_VERSION = "1.2.6";
 
     const QString UPDATE_SERVER_URL = "https://storm-browser.online:8002";
 

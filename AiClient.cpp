@@ -1,4 +1,5 @@
 #include "AiClient.h"
+#include "CertificateManager.h"
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -19,13 +20,18 @@
 // префикса ради единообразия с ResearchWidget/ResearchManager.
 
 namespace {
-    // Тот же приём, что в оригинальном applyGigaChatSslBypass(QNetworkRequest&)
-    // из AIAssistantWidget.cpp — вынесен сюда как маленькая свободная функция,
-    // чтобы AiClient не зависел от AIAssistantWidget.cpp.
-    void applyGigaChatSslBypass(QNetworkRequest& req) {
-        QSslConfiguration sslConf = req.sslConfiguration();
-        sslConf.setPeerVerifyMode(QSslSocket::VerifyNone);
-        req.setSslConfiguration(sslConf);
+    // Раньше называлась applyGigaChatSslBypass и делала
+    // sslConf.setPeerVerifyMode(QSslSocket::VerifyNone) — полностью
+    // отключала проверку сертификата (принимался бы вообще любой, в т.ч.
+    // поддельный MITM-сертификат). Сервер GigaChat использует TLS-
+    // сертификат, выпущенный НУЦ Минцифры, которому Qt/ОС не доверяют "из
+    // коробки" — теперь, когда CertificateManager знает про встроенные
+    // корневые сертификаты Минцифры, используем нормальную проверку с
+    // расширенным списком доверенных CA вместо полного отключения. Имя
+    // функции обновлено, чтобы не вводить в заблуждение — по факту это
+    // больше не "обход", а "доверие конкретному корню".
+    void applyGigaChatTrustedSsl(QNetworkRequest& req) {
+        req.setSslConfiguration(CertificateManager::trustedSslConfiguration());
     }
 }
 
@@ -83,7 +89,7 @@ void AiClient::sendRequest(const QString& requestId, const QJsonArray& messages,
         request.setUrl(QUrl("https://api.giga.chat/v1/chat/completions"));
         request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
         request.setRawHeader("Authorization", ("Bearer " + m_cachedGigaToken).toUtf8());
-        applyGigaChatSslBypass(request);
+        applyGigaChatTrustedSsl(request);
         reply = net()->post(request, QJsonDocument(json).toJson());
     }
     else {
@@ -176,7 +182,7 @@ bool AiClient::ensureGigaChatToken(const QString& gigaKey, QString& errorOut) {
     authReq.setRawHeader("Accept", "application/json");
     authReq.setRawHeader("RqUID", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8());
     authReq.setRawHeader("Authorization", ("Basic " + gigaKey).toUtf8());
-    applyGigaChatSslBypass(authReq);
+    applyGigaChatTrustedSsl(authReq);
 
     // Временный локальный менеджер на стеке — как и в оригинальном
     // AIAssistantWidget::ensureGigaChatToken. Это синхронный вызов через

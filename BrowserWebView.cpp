@@ -18,6 +18,12 @@
 #include <QFile>
 #include <QTextStream>
 #include <QProcess>
+#include <QSettings>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
 
 BrowserWebView::BrowserWebView(MainWindow* mw, QWidget* parent)
     : QWebEngineView(parent), mainWindow(mw) {
@@ -158,6 +164,9 @@ void BrowserWebView::contextMenuEvent(QContextMenuEvent* event) {
         QAction* genPwdAction = menu.addAction(u8"🔑 Сгенерировать надежный пароль");
         connect(genPwdAction, &QAction::triggered, this, &BrowserWebView::generateAndSavePassword);
 
+        QAction* insertAddressAction = menu.addAction(u8"📇 Вставить сохранённый адрес");
+        connect(insertAddressAction, &QAction::triggered, this, &BrowserWebView::insertSavedAddress);
+
         addWebAction(WA::SelectAll, u8"Выделить всё");
         menu.addSeparator();
     }
@@ -289,6 +298,127 @@ void BrowserWebView::generateAndSavePassword() {
 
     page()->runJavaScript(jsFill);
     mainWindow->statusBar()->showMessage(u8"✅ Пароль сгенерирован, сохранен и вставлен!", 5000);
+}
+
+void BrowserWebView::insertSavedAddress() {
+    // Тот же QSettings-ключ, что читает/пишет SettingsBridge (getSavedAddressesJson/
+    // addSavedAddress) — отдельного менеджера для адресов пока нет, чтобы не
+    // плодить сущность только ради списка из нескольких полей.
+    QJsonDocument doc = QJsonDocument::fromJson(QSettings().value("autofill/addresses").toByteArray());
+    QJsonArray addresses = doc.isArray() ? doc.array() : QJsonArray();
+
+    if (addresses.isEmpty()) {
+        mainWindow->statusBar()->showMessage(
+            u8"Нет сохранённых адресов — добавьте их в Настройках → Пароли", 5000);
+        return;
+    }
+
+    QJsonObject chosen;
+    if (addresses.size() == 1) {
+        chosen = addresses.first().toObject();
+    }
+    else {
+        QStringList labels;
+        for (const QJsonValue& v : addresses) {
+            QJsonObject a = v.toObject();
+            QString label = a["fullName"].toString();
+            if (!a["city"].toString().isEmpty()) label += " — " + a["city"].toString();
+            labels << (label.trimmed().isEmpty() ? u8"(без имени)" : label);
+        }
+        bool ok = false;
+        QString pick = QInputDialog::getItem(mainWindow, u8"Выбор адреса",
+            u8"Какой адрес вставить?", labels, 0, false, &ok);
+        if (!ok) return;
+        chosen = addresses.at(labels.indexOf(pick)).toObject();
+    }
+
+    auto esc = [](QString s) { s.replace("\\", "\\\\").replace("'", "\\'"); return s; };
+
+    // Эвристика по atrибуту autocomplete (стандартный способ, которым сами
+    // сайты помечают поля форм для автозаполнения — тот же принцип
+    // используют настоящие браузеры), с запасным поиском по name/id, если
+    // autocomplete не проставлен.
+    QString js = QString(u8R"JS(
+        (function() {
+            const data = {
+                fullName: '%1', phone: '%2', email: '%3',
+                addressLine: '%4', city: '%5', zip: '%6'
+            };
+            function fillAll(selector, value) {
+                if (!value) return;
+                document.querySelectorAll(selector).forEach(function(inp) {
+                    inp.value = value;
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                });
+            }
+            fillAll('[autocomplete="name"], input[name*="name" i], input[id*="name" i]', data.fullName);
+            fillAll('[autocomplete="tel"], input[type="tel"], input[name*="phone" i], input[id*="phone" i]', data.phone);
+            fillAll('[autocomplete="email"], input[type="email"], input[name*="email" i], input[id*="email" i]', data.email);
+            fillAll('[autocomplete="address-line1"], input[name*="address" i], input[id*="address" i]', data.addressLine);
+            fillAll('[autocomplete="address-level2"], input[name*="city" i], input[id*="city" i]', data.city);
+            fillAll('[autocomplete="postal-code"], input[name*="zip" i], input[name*="postal" i], input[id*="zip" i]', data.zip);
+        })();
+    )JS").arg(esc(chosen["fullName"].toString()), esc(chosen["phone"].toString()), esc(chosen["email"].toString()),
+    esc(chosen["addressLine"].toString()), esc(chosen["city"].toString()), esc(chosen["zip"].toString()));
+
+    page()->runJavaScript(js);
+    mainWindow->statusBar()->showMessage(u8"✅ Адрес вставлен (проверьте поля — эвристика не идеальна)", 5000);
+}
+
+// ==========================================
+// Разрешения сайтов (камера/микрофон/геолокация/уведомления)
+// ==========================================
+namespace {
+    QString permissionSettingsKey(const QUrl& origin, QWebEnginePage::Feature feature) {
+        return QString("permissions/%1/%2").arg(int(feature)).arg(origin.host());
+    }
+}
+
+QString BrowserWebView::featureDisplayName(QWebEnginePage::Feature feature) {
+    switch (feature) {
+    case QWebEnginePage::Geolocation: return u8"Геолокация";
+    case QWebEnginePage::MediaAudioCapture: return u8"Микрофон";
+    case QWebEnginePage::MediaVideoCapture: return u8"Камера";
+    case QWebEnginePage::MediaAudioVideoCapture: return u8"Камера и микрофон";
+    case QWebEnginePage::MouseLock: return u8"Захват курсора мыши";
+    case QWebEnginePage::DesktopVideoCapture: return u8"Запись экрана";
+    case QWebEnginePage::DesktopAudioVideoCapture: return u8"Запись экрана со звуком";
+    case QWebEnginePage::Notifications: return u8"Уведомления";
+    default: return u8"Разрешение";
+    }
+}
+
+void BrowserWebView::handlePermissionRequest(QWebEnginePage* page, MainWindow* mw,
+    const QUrl& securityOrigin, QWebEnginePage::Feature feature) {
+    if (!page) return;
+
+    const QString key = permissionSettingsKey(securityOrigin, feature);
+
+    QSettings s;
+    // Уже решали для этого сайта и этого разрешения раньше — применяем
+    // сохранённый выбор молча, без повторного вопроса. Сбросить можно в
+    // Настройках → Конфиденциальность → Разрешения сайтов.
+    if (s.contains(key)) {
+        bool allowed = s.value(key).toBool();
+        page->setFeaturePermission(securityOrigin, feature,
+            allowed ? QWebEnginePage::PermissionGrantedByUser : QWebEnginePage::PermissionDeniedByUser);
+        return;
+    }
+
+    QMessageBox box(mw);
+    box.setWindowTitle(u8"Запрос разрешения");
+    box.setText(QString(u8"Сайт %1 запрашивает разрешение:\n%2")
+        .arg(securityOrigin.host(), BrowserWebView::featureDisplayName(feature)));
+    QPushButton* allowBtn = box.addButton(u8"Разрешить", QMessageBox::AcceptRole);
+    QPushButton* blockBtn = box.addButton(u8"Заблокировать", QMessageBox::RejectRole);
+    box.setDefaultButton(blockBtn);
+    box.exec();
+
+    bool allow = (box.clickedButton() == allowBtn);
+    page->setFeaturePermission(securityOrigin, feature,
+        allow ? QWebEnginePage::PermissionGrantedByUser : QWebEnginePage::PermissionDeniedByUser);
+    s.setValue(key, allow);
 }
 
 // ==========================================

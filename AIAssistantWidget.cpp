@@ -1,5 +1,6 @@
 #include "AIAssistantWidget.h"
 #include "WebPageAgent.h"
+#include "CertificateManager.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QSettings>
@@ -35,10 +36,21 @@ static void migrateLegacyAiKey() {
     s.remove("ai/api_key");
 }
 
-static void applyGigaChatSslBypass(QNetworkRequest& req) {
-    QSslConfiguration sslConf = req.sslConfiguration();
-    sslConf.setPeerVerifyMode(QSslSocket::VerifyNone);
-    req.setSslConfiguration(sslConf);
+// Раньше называлась applyGigaChatSslBypass и делала
+// sslConf.setPeerVerifyMode(QSslSocket::VerifyNone) — полностью отключала
+// проверку сертификата (принимался бы вообще любой, в т.ч. поддельный MITM-
+// сертификат). Судя по всему, именно отсюда этот приём разошёлся копиями по
+// AiClient.cpp/AiAgentTaskRunner.cpp/HomeAIBridge.cpp/SettingsBridge.cpp —
+// сервер GigaChat использует TLS-сертификат, выпущенный НУЦ Минцифры,
+// которому Qt/ОС не доверяют "из коробки". Теперь, когда у
+// CertificateManager есть встроенные корневые сертификаты Минцифры,
+// используем нормальную проверку с расширенным списком доверенных CA вместо
+// полного отключения — запрос по-прежнему отклонит настоящий MITM-
+// сертификат, а не примет вообще любой. Имя функции обновлено (как и во
+// всех остальных копиях), чтобы не вводить в заблуждение — по факту это
+// больше не "обход", а "доверие конкретному корню".
+static void applyGigaChatTrustedSsl(QNetworkRequest& req) {
+    req.setSslConfiguration(CertificateManager::trustedSslConfiguration());
 }
 
 // Системный промпт "агентного" режима — отправляется с КАЖДЫМ сообщением.
@@ -61,6 +73,7 @@ static QString agentSystemPrompt() {
 - "look" — самый крайний и самый дорогой вариант: он делает снимок экрана страницы и присылает тебе его как картинку, чтобы ты сориентировался визуально. Используй его, только если несколько попыток через click/target_text/scroll не помогли разобраться в странице по тексту — не в начале задачи и не при каждом шаге. Если "look" по какой-то причине недоступен (например, для текущего бэкенда не настроена vision-модель), тебе придёт об этом сообщение — в этом случае просто продолжай обычными способами.
 - Никогда не угадывай адрес для "navigate" внутри того же сайта (не выдумывай /ссылки/, /id, /слаги и т.п.). "navigate" используй только если точный адрес есть в предоставленных данных (например, в поле href элемента) или это переход на заведомо известный внешний сайт по прямой просьбе пользователя. Для перехода внутри сайта (открыть карточку, раздел, профиль) всегда предпочитай click/target_text, а не navigate.
 - Если предыдущее действие завершилось со статусом "не удалось" ИЛИ проверка показала, что страница не изменилась — не повторяй его в том же виде ещё раз. Попробуй другой способ: click по target_text вместо id, прокрути страницу (scroll), либо посмотри на обновлённый список elements и выбери другой подходящий элемент.
+- Если в статусе последнего действия сказано, что элемент найден, но перекрыт другим (баннер cookie-согласия, всплывающее окно, липкая шапка) — сначала найди и нажми на элемент, который закрывает/принимает этот баннер/окно (обычно с текстом вроде "Принять", "Согласен", "×", "Закрыть"), и только потом возвращайся к исходной задаче.
 - Прежде чем написать "мы уже на нужной странице/разделе" — ВСЕГДА сверяйся со строками "Текущий адрес (URL)" и "Заголовок вкладки" в присланном состоянии страницы, а не только с текстом на странице. Упоминание, репост или ссылка на что-либо в тексте страницы (например, пост на стене пользователя со ссылкой на сообщество) — это НЕ доказательство, что ты уже находишься на этой странице. Если URL/заголовок не соответствуют цели — ты туда не попал, продолжай (клик по ссылке/карточке, либо новая попытка).
 - Если для ответа не нужно ничего делать на странице (обычный вопрос, объяснение и т.п.) — сразу верни "action": {"type": "done"}, а весь ответ помести в "message".
 - Если задача выполнена, невозможна или зашла в тупик после нескольких разных попыток — верни "action": {"type": "done"} и понятно объясни итог в "message".
@@ -274,7 +287,7 @@ bool AIAssistantWidget::ensureGigaChatToken(const QString& gigaKey, QString& err
     authReq.setRawHeader("Accept", "application/json");
     authReq.setRawHeader("RqUID", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8());
     authReq.setRawHeader("Authorization", ("Basic " + gigaKey).toUtf8());
-    applyGigaChatSslBypass(authReq);
+    applyGigaChatTrustedSsl(authReq);
 
     QNetworkAccessManager authManager;
     QNetworkReply* authReply = authManager.post(authReq, "scope=GIGACHAT_API_PERS");
@@ -311,7 +324,7 @@ bool AIAssistantWidget::uploadImageToGigaChat(const QByteArray& pngBytes, QStrin
 
     QNetworkRequest request(QUrl("https://api.giga.chat/v1/files"));
     request.setRawHeader("Authorization", ("Bearer " + cachedGigaToken).toUtf8());
-    applyGigaChatSslBypass(request);
+    applyGigaChatTrustedSsl(request);
 
     QNetworkAccessManager uploadManager;
     QNetworkReply* reply = uploadManager.post(request, multiPart);
@@ -661,7 +674,7 @@ void AIAssistantWidget::postQuickRequest(const QJsonArray& messages, bool wantJs
         request.setUrl(QUrl("https://api.giga.chat/v1/chat/completions"));
         request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
         request.setRawHeader("Authorization", ("Bearer " + cachedGigaToken).toUtf8());
-        applyGigaChatSslBypass(request);
+        applyGigaChatTrustedSsl(request);
         reply = m_quickManager->post(request, QJsonDocument(json).toJson());
     }
     else {
@@ -854,7 +867,7 @@ void AIAssistantWidget::sendAgentRequest() {
             request.setUrl(QUrl("https://api.giga.chat/v1/chat/completions"));
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
             request.setRawHeader("Authorization", ("Bearer " + cachedGigaToken).toUtf8());
-            applyGigaChatSslBypass(request);
+            applyGigaChatTrustedSsl(request);
             networkManager->post(request, QJsonDocument(json).toJson());
         }
         else {
@@ -988,7 +1001,7 @@ void AIAssistantWidget::performVisionLook() {
             request.setUrl(QUrl("https://api.giga.chat/v1/chat/completions"));
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
             request.setRawHeader("Authorization", ("Bearer " + cachedGigaToken).toUtf8());
-            applyGigaChatSslBypass(request);
+            applyGigaChatTrustedSsl(request);
             networkManager->post(request, QJsonDocument(json).toJson());
         }
         });
@@ -1105,12 +1118,24 @@ void AIAssistantWidget::onAgentNetworkReply(QNetworkReply* reply) {
     else stepLabel = u8"выполняю действие…";
     m_pageAgent->updateStatus(stepLabel);
 
-    m_pageAgent->executeAction(action, [this, actionType](bool success) {
+    m_pageAgent->executeAction(action, [this, actionType](bool success, QString detail) {
         if (!m_agentRunning) return;
 
-        m_lastActionSummary = QString(u8"[%1] — %2").arg(actionType, success ? u8"выполнено" : u8"не удалось (элемент не найден или устарел, список элементов будет обновлён)");
+        // detail теперь может содержать конкретную причину неудачи (не найден / перекрыт
+        // другим элементом и т.п.) — передаём её ИИ как есть, вместо общей фразы, чтобы
+        // модель реагировала осознанно (например, сперва закрыла баннер), а не наугад.
+        QString statusPart = success
+            ? u8"выполнено"
+            : (!detail.isEmpty() ? (u8"не удалось — " + detail) : u8"не удалось (элемент не найден или устарел, список элементов будет обновлён)");
+        m_lastActionSummary = QString(u8"[%1] — %2").arg(actionType, statusPart);
 
-        int fallbackDelay = (actionType == "navigate") ? 8000 : 900;
+        // Раньше здесь был фиксированный таймер (900 мс / 8000 мс для navigate) — если SPA
+        // перерисовывалась дольше, следующий снимок страницы захватывался "на лету", и
+        // verificationNote ошибочно решал, что действие ни на что не повлияло. Теперь
+        // ожидание опирается на реальное "оседание" страницы (см. scheduleNextAgentStep),
+        // а числа ниже — лишь верхний потолок на случай, если страница никогда не
+        // "успокаивается" полностью (постоянные анимации, счётчики, чат-виджеты).
+        int fallbackDelay = (actionType == "navigate") ? 6000 : 2500;
         scheduleNextAgentStep(fallbackDelay);
         });
 }
@@ -1118,8 +1143,14 @@ void AIAssistantWidget::onAgentNetworkReply(QNetworkReply* reply) {
 void AIAssistantWidget::scheduleNextAgentStep(int fallbackDelayMs) {
     if (!m_agentRunning) return;
 
-    // После действия ждём либо реальной загрузки страницы (если клик привёл к переходу),
-    // либо fallback-таймаут — что наступит раньше. Флаг proceeded защищает от двойного вызова.
+    // После действия ждём то, что наступит раньше:
+    //  1) реальную загрузку страницы (если клик/navigate привели к полноценному переходу) —
+    //     через loadFinished;
+    //  2) "оседание" страницы без полной перезагрузки (типично для SPA — React/Vue меняют
+    //     DOM через pushState без loadFinished) — через m_pageAgent->waitForSettle(), которое
+    //     само ждёт отсутствия DOM-мутаций некоторое время вместо слепого фиксированного
+    //     таймера, но не дольше fallbackDelayMs.
+    // Флаг proceeded защищает от двойного вызова, если оба пути сработают почти одновременно.
     auto proceeded = std::make_shared<bool>(false);
     auto conn = std::make_shared<QMetaObject::Connection>();
 
@@ -1133,12 +1164,12 @@ void AIAssistantWidget::scheduleNextAgentStep(int fallbackDelayMs) {
             });
     }
 
-    QTimer::singleShot(fallbackDelayMs, this, [this, proceeded, conn]() {
+    m_pageAgent->waitForSettle([this, proceeded, conn]() {
         if (*proceeded) return;
         *proceeded = true;
         if (*conn) QObject::disconnect(*conn);
         if (m_agentRunning) sendAgentRequest();
-        });
+        }, fallbackDelayMs);
 }
 
 void AIAssistantWidget::finishAgentTask() {

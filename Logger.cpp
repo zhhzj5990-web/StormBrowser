@@ -33,8 +33,8 @@ namespace {
     // (qWarning/qCritical) оно было отправлено.
     bool isOwnFeatureDiagnostic(const QString& msg) {
         return msg.contains(QString::fromUtf8(u8"📹")) ||  // Talk Widget
-               msg.contains(QString::fromUtf8(u8"🔑")) ||  // Password Capture
-               msg.contains(QString::fromUtf8(u8"🕹️"));   // Arcade Widget
+            msg.contains(QString::fromUtf8(u8"🔑")) ||  // Password Capture
+            msg.contains(QString::fromUtf8(u8"🕹️"));   // Arcade Widget
     }
 
     // Защита от спама: если один и тот же текст сообщения прилетает повторно
@@ -118,9 +118,11 @@ void customMessageHandler(QtMsgType type, const QMessageLogContext& context, con
     QString levelStr;
     if (isFatal) {
         levelStr = "[FATAL]";
-    } else if (type == QtCriticalMsg) {
+    }
+    else if (type == QtCriticalMsg) {
         levelStr = "[CRITICAL]";
-    } else {
+    }
+    else {
         levelStr = "[WARNING]";
     }
 

@@ -270,6 +270,14 @@ void AdblockManager::applyCosmeticAndStealthScripts(QWebEngineProfile* profile) 
     }
     QString stealthJs = QString(u8R"JS(
         (function() {
+            // Сервисы Google/YouTube проверяют "подлинность" браузера (BotGuard):
+            // подмена navigator.* и toDataURL делает окружение "подозрительным",
+            // и плеер YouTube после первых сегментов может получать отказ.
+            // Для них анти-фингерпринтинг не применяем.
+            const h = (location.hostname || '').toLowerCase();
+            const skip = ['youtube.com', 'youtube-nocookie.com', 'googlevideo.com', 'ytimg.com',
+                          'google.com', 'gstatic.com', 'googleusercontent.com', 'ggpht.com'];
+            if (skip.some(d => h === d || h.endsWith('.' + d))) return;
             const noise = %1;
             const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
             HTMLCanvasElement.prototype.toDataURL = function() {

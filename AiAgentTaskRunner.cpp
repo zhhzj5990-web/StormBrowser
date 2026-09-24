@@ -1,5 +1,6 @@
 #include "AiAgentTaskRunner.h"
 #include "WebPageAgent.h"
+#include "CertificateManager.h"
 #include <QSettings>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
@@ -19,13 +20,18 @@
 #include <QWebEnginePage>
 #include <memory>
 
-// Тот же обход проверки сертификата, что и в
-// AIAssistantWidget.cpp/SettingsBridge.cpp — особенность серверов GigaChat,
-// не общая практика для остальных запросов.
-static void applyGigaChatSslBypass(QNetworkRequest& req) {
-    QSslConfiguration sslConf = req.sslConfiguration();
-    sslConf.setPeerVerifyMode(QSslSocket::VerifyNone);
-    req.setSslConfiguration(sslConf);
+// Раньше называлась applyGigaChatSslBypass и делала
+// sslConf.setPeerVerifyMode(QSslSocket::VerifyNone) — полностью отключала
+// проверку сертификата (принимался бы вообще любой, в т.ч. поддельный MITM-
+// сертификат). Сервер GigaChat использует TLS-сертификат, выпущенный НУЦ
+// Минцифры, которому Qt/ОС не доверяют "из коробки" — теперь, когда
+// CertificateManager знает про встроенные корневые сертификаты Минцифры,
+// используем нормальную проверку с расширенным списком доверенных CA вместо
+// полного отключения. Имя функции обновлено, чтобы не вводить в
+// заблуждение — по факту это больше не "обход", а "доверие конкретному
+// корню". Тот же приём применён в AiClient.cpp и SettingsBridge.cpp.
+static void applyGigaChatTrustedSsl(QNetworkRequest& req) {
+    req.setSslConfiguration(CertificateManager::trustedSslConfiguration());
 }
 
 // Компактная "подпись" действия — для сравнения "это то же самое действие,
@@ -241,7 +247,7 @@ void AiAgentTaskRunner::sendStep() {
             request.setUrl(QUrl("https://api.giga.chat/v1/chat/completions"));
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
             request.setRawHeader("Authorization", ("Bearer " + m_cachedGigaToken).toUtf8());
-            applyGigaChatSslBypass(request);
+            applyGigaChatTrustedSsl(request);
             m_networkManager->post(request, QJsonDocument(json).toJson());
         }
         else {
@@ -274,7 +280,7 @@ bool AiAgentTaskRunner::ensureGigaChatToken(const QString& gigaKey, QString& err
     // весь AiAgentTaskRunner (и, как следствие, вся публикация) встал бы
     // намертво, а не просто "долго ждал".
     authReq.setTransferTimeout(15000);
-    applyGigaChatSslBypass(authReq);
+    applyGigaChatTrustedSsl(authReq);
 
     QNetworkAccessManager authManager;
     QNetworkReply* authReply = authManager.post(authReq, "scope=GIGACHAT_API_PERS");
@@ -442,7 +448,7 @@ void AiAgentTaskRunner::onNetworkReply(QNetworkReply* reply) {
     else if (actionType == "navigate") stepLabel = u8"перехожу по ссылке…";
     m_agent->updateStatus(stepLabel);
 
-    m_agent->executeAction(action, [this, actionType, sig](bool success) {
+    m_agent->executeAction(action, [this, actionType, sig](bool success, const QString& /*detail*/) {
         if (!m_running) return;
 
         // Запоминаем сигнатуру ТОЛЬКО провалившегося действия — успешное

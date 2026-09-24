@@ -1,13 +1,10 @@
 #include "HomeAIBridge.h"
+#include "CertificateManager.h"
 #include <QSettings>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QNetworkRequest>
 #include <QUrl>
-#include <QSslConfiguration>
-#include <QSslCertificate>
-#include <QFile>
-#include <QCoreApplication>
 #include <QUuid>
 #include <QDateTime>
 #include <QTimer>
@@ -21,34 +18,22 @@ namespace {
     const QString STORM_CLOUD_AI_IMAGE_URL = QStringLiteral("https://storm-browser.online:8000/api/ai/image");
     constexpr int kNetworkTimeoutMs = 30000;
 
-    void applyRussianTrustedCa(QNetworkRequest& req) {
-        QSslConfiguration sslConf = req.sslConfiguration();
-        sslConf.setPeerVerifyMode(QSslSocket::VerifyPeer);
-
-        static const QList<QSslCertificate> extraCerts = [] {
-            QList<QSslCertificate> certs;
-            const QStringList candidatePaths = {
-                QCoreApplication::applicationDirPath() + "/certs/russian_trusted_root_ca.pem",
-                QCoreApplication::applicationDirPath() + "/certs/russian_trusted_sub_ca.pem",
-                ":/certs/russian_trusted_root_ca.pem",
-                ":/certs/russian_trusted_sub_ca.pem",
-            };
-            for (const QString& path : candidatePaths) {
-                QFile f(path);
-                if (f.open(QIODevice::ReadOnly)) {
-                    certs += QSslCertificate::fromData(f.readAll(), QSsl::Pem);
-                }
-            }
-            return certs;
-            }();
-
-        if (!extraCerts.isEmpty()) {
-            QList<QSslCertificate> chain = sslConf.caCertificates();
-            chain += extraCerts;
-            sslConf.setCaCertificates(chain);
-        }
-
-        req.setSslConfiguration(sslConf);
+    // Раньше называлась applyRussianTrustedCa и сама читала PEM-файлы
+    // (applicationDirPath()/certs/*.pem либо :/certs/*.pem) — независимая от
+    // остального проекта копия того же самого доверия к корню Минцифры, со
+    // своим набором путей и форматом (.pem), отдельным от того, что грузит
+    // CertificateManager (.cer/.pem из :/certs/, см. CertificateManager.cpp).
+    // Держать два независимых списка доверенных сертификатов в разных файлах
+    // рискованно — правка/добавление сертификата в одном месте не долетела
+    // бы до другого. Теперь оба используют одну и ту же точку правды —
+    // CertificateManager::trustedSslConfiguration() (та же, что в
+    // AiClient.cpp/AiAgentTaskRunner.cpp/SettingsBridge.cpp), которая к тому
+    // же учитывает тумблер "Использовать сертификаты Windows" и
+    // пользовательские сертификаты — то, чего в этой самодельной версии не
+    // было вовсе. Имя функции приведено к тому же виду, что в
+    // AiClient.cpp/AiAgentTaskRunner.cpp.
+    void applyGigaChatTrustedSsl(QNetworkRequest& req) {
+        req.setSslConfiguration(CertificateManager::trustedSslConfiguration());
     }
 }
 
@@ -251,7 +236,7 @@ void HomeAIBridge::downloadGigaChatImage(const QString& fileId, const QString& t
     QNetworkRequest req(QUrl("https://api.giga.chat/v1/files/" + fileId + "/content"));
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/jpg");
     req.setRawHeader("Authorization", ("Bearer " + token).toUtf8());
-    applyRussianTrustedCa(req);
+    applyGigaChatTrustedSsl(req);
 
     // ВАЖНО: НЕ используем m_netManager — он подключён к onNetworkReply() через
     // QNetworkAccessManager::finished для ВСЕХ своих запросов, и бинарный ответ
@@ -297,7 +282,7 @@ void HomeAIBridge::continueWithGigaChat(const QJsonObject& baseJson, const QStri
         request.setUrl(QUrl("https://api.giga.chat/v1/chat/completions"));
         request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
         request.setRawHeader("Authorization", ("Bearer " + m_cachedGigaToken).toUtf8());
-        applyRussianTrustedCa(request);
+        applyGigaChatTrustedSsl(request);
 
         sendChatRequest(request, QJsonDocument(json).toJson(), isFinal);
         return;
@@ -313,7 +298,7 @@ void HomeAIBridge::continueWithGigaChat(const QJsonObject& baseJson, const QStri
     authReq.setRawHeader("RqUID", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8());
     authReq.setRawHeader("Authorization", ("Basic " + gigaKey).toUtf8());
     authReq.setTransferTimeout(kNetworkTimeoutMs);
-    applyRussianTrustedCa(authReq);
+    applyGigaChatTrustedSsl(authReq);
 
     QNetworkReply* authReply = m_authManager->post(authReq, "scope=GIGACHAT_API_PERS");
     m_pendingReply = authReply;

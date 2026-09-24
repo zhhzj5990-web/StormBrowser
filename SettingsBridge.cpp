@@ -5,6 +5,9 @@
 #include "ShieldInterceptor.h"
 #include "DownloadManager.h"
 #include "UpdateManager.h"
+#include "CertificateManager.h"
+#include "BrowserWebView.h"
+#include "PasswordManager.h"
 #include "Logger.h"
 #include <QSettings>
 #include <QMessageBox>
@@ -21,6 +24,10 @@
 #include <QSslConfiguration>
 #include <QSslSocket>
 #include <QUuid>
+#include <QProcess>
+#include <QStringList>
+#include <QCryptographicHash>
+#include <memory>
 
 // --- ОДНОРАЗОВАЯ МИГРАЦИЯ СТАРОГО КЛЮЧА ИИ ---
 // Раньше ключ ИИ сохранялся под разными именами QSettings в разных частях
@@ -109,9 +116,125 @@ QString SettingsBridge::getCurrentZoom() {
     return mw->getCurrentZoomString();
 }
 
-void SettingsBridge::openProxy() {
-    ProxyDialog dlg(mw);
-    dlg.exec();
+void SettingsBridge::toggleSidebarVisible(bool enabled) {
+    if (mw->isSidebarVisible() != enabled) {
+        mw->toggleSidebar();
+    }
+}
+
+void SettingsBridge::setSidebarPosition(const QString& position) {
+    mw->setSidebarPosition(position);
+}
+
+// ==========================================
+// --- PROXY / VPN ---
+// Раньше это открывало отдельное окно ProxyDialog. Теперь Proxy/VPN — часть
+// страницы настроек (см. SettingsPageHtml.cpp, раздел "🌐 Proxy / VPN"),
+// а вместо кнопок "Подключить"/"Применить" там тумблеры — вся логика,
+// которая раньше жила в слотах ProxyDialog, перенесена сюда один в один,
+// только результат теперь уходит в JS не напрямую (через statusLabel),
+// а сигналами, на которые страница настроек подписывается.
+// ==========================================
+
+QString SettingsBridge::getProxyStatusJson() {
+    bool connected = ProxyManager::isConnected();
+    QJsonObject obj;
+    obj["connected"] = connected;
+    obj["statusText"] = connected
+        ? QSettings().value("proxy/last_status_text", u8"Статус: Подключено").toString()
+        : QString(u8"Статус: Отключено");
+    obj["smartLink"] = QSettings().value("proxy/smart_link", "").toString();
+    return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+}
+
+void SettingsBridge::connectSmartLink(const QString& rawLink) {
+    QString link = rawLink.trimmed();
+    if (link.isEmpty()) {
+        emit proxyConnectResult(false, u8"Вставьте ссылку-ключ перед подключением", "");
+        return;
+    }
+
+    QString protocolName;
+    auto [success, msg] = ProxyManager::connectFromLink(link, protocolName);
+    if (success) {
+        QSettings().setValue("proxy/smart_link", link);
+        QSettings().setValue("is_official_vpn", "false");
+    }
+    emit proxyConnectResult(success, msg, protocolName);
+}
+
+void SettingsBridge::deleteSmartLink() {
+    QSettings().remove("proxy/smart_link");
+}
+
+void SettingsBridge::applyManualProxy(const QString& type, const QString& host, int port, const QString& user, const QString& pass) {
+    bool ok = false;
+    QString statusText;
+    if (!host.isEmpty() && port > 0) {
+        ok = ProxyManager::applyProxy(type, host, static_cast<quint16>(port), user, pass);
+        if (ok) {
+            statusText = QString(u8"Статус: %1:%2").arg(host).arg(port);
+            QSettings().setValue("proxy/last_status_text", statusText);
+            QSettings().setValue("is_official_vpn", "false");
+        }
+    }
+    emit proxyManualApplyResult(ok, statusText);
+}
+
+void SettingsBridge::applyListProxy(const QString& type, const QString& hostPort) {
+    QStringList parts = hostPort.split(":");
+    bool ok = false;
+    QString statusText;
+    if (parts.size() == 2) {
+        quint16 port = static_cast<quint16>(parts[1].toUInt());
+        ok = ProxyManager::applyProxy(type, parts[0], port);
+        if (ok) {
+            statusText = u8"Статус: " + parts[0];
+            QSettings().setValue("proxy/last_status_text", statusText);
+            QSettings().setValue("is_official_vpn", "false");
+        }
+    }
+    emit proxyManualApplyResult(ok, statusText);
+}
+
+void SettingsBridge::disableProxyAll() {
+    ProxyManager::disableProxy();
+    QSettings().setValue("is_official_vpn", "false");
+    QSettings().remove("proxy/last_status_text");
+}
+
+void SettingsBridge::fetchFreeProxies(const QString& type) {
+    // Тот же источник списков, что и раньше использовал ProxyDialog::startFetchProxies.
+    QString url = (type.toUpper() == "SOCKS5")
+        ? "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"
+        : "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt";
+
+    // Владелец — mw, а не this, по той же причине, что и в testAiConnection():
+    // страница настроек может закрыться раньше ответа сервера.
+    auto* manager = new QNetworkAccessManager(mw);
+    QNetworkReply* reply = manager->get(QNetworkRequest(QUrl(url)));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, manager]() {
+        QJsonArray arr;
+        if (reply->error() == QNetworkReply::NoError) {
+            QString text = QString::fromUtf8(reply->readAll());
+            QStringList lines = text.split("\n", Qt::SkipEmptyParts);
+            int count = 0;
+            for (const QString& line : lines) {
+                QString trimmed = line.trimmed();
+                if (trimmed.contains(":")) {
+                    arr.append(trimmed);
+                    if (++count >= 100) break; // Берём первые 100
+                }
+            }
+        }
+        emit freeProxiesFetched(QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact)));
+        reply->deleteLater();
+        manager->deleteLater();
+        });
+}
+
+void SettingsBridge::openWizardVpnRef() {
+    QDesktopServices::openUrl(QUrl("http://wizardvpn.co/ref/75362"));
 }
 
 void SettingsBridge::toggleShield(bool enabled) {
@@ -184,6 +307,112 @@ void SettingsBridge::removeShieldException(const QString& host) {
     s.setValue("shield/exceptions", list);
 }
 
+void SettingsBridge::toggleHttpsOnly(bool enabled) {
+    QSettings().setValue("browser/https_only", enabled);
+    QMessageBox::information(mw, u8"Требуется перезапуск",
+        u8"Настройка сохранена. Перезапустите Storm Browser для применения изменений.");
+}
+
+void SettingsBridge::toggleClearSiteDataOnClose(bool enabled) {
+    QSettings().setValue("browser/clear_site_data_on_close", enabled);
+}
+
+QString SettingsBridge::getSiteDataExceptionsJson() {
+    QJsonArray arr;
+    for (const QString& host : QSettings().value("browser/site_data_exceptions").toStringList()) {
+        arr.append(host);
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void SettingsBridge::addSiteDataException(const QString& host) {
+    // То же извлечение домена из произвольной ссылки, что и в addShieldException().
+    QString raw = host.trimmed();
+    if (raw.isEmpty()) return;
+    QString h = QUrl(raw.contains("://") ? raw : ("http://" + raw)).host().toLower();
+    if (h.isEmpty()) return;
+
+    QSettings s;
+    QStringList list = s.value("browser/site_data_exceptions").toStringList();
+    if (!list.contains(h, Qt::CaseInsensitive)) {
+        list.append(h);
+        s.setValue("browser/site_data_exceptions", list);
+    }
+}
+
+void SettingsBridge::removeSiteDataException(const QString& host) {
+    QString h = host.trimmed().toLower();
+    if (h.isEmpty()) return;
+
+    QSettings s;
+    QStringList list = s.value("browser/site_data_exceptions").toStringList();
+    for (int i = list.size() - 1; i >= 0; --i) {
+        if (list.at(i).compare(h, Qt::CaseInsensitive) == 0) list.removeAt(i);
+    }
+    s.setValue("browser/site_data_exceptions", list);
+}
+
+QString SettingsBridge::getSitePermissionsJson() {
+    QSettings s;
+    QJsonArray arr;
+    s.beginGroup("permissions");
+    for (const QString& featureGroup : s.childGroups()) {
+        s.beginGroup(featureGroup);
+        int featureId = featureGroup.toInt();
+        for (const QString& host : s.childKeys()) {
+            QJsonObject obj;
+            obj["featureId"] = featureId;
+            obj["feature"] = BrowserWebView::featureDisplayName(static_cast<QWebEnginePage::Feature>(featureId));
+            obj["host"] = host;
+            obj["allowed"] = s.value(host).toBool();
+            arr.append(obj);
+        }
+        s.endGroup();
+    }
+    s.endGroup();
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void SettingsBridge::revokeSitePermission(int featureId, const QString& host) {
+    QSettings().remove(QString("permissions/%1/%2").arg(featureId).arg(host));
+}
+
+QString SettingsBridge::getCertificatesJson() {
+    return QString::fromUtf8(QJsonDocument(CertificateManager::manageableCertificatesJson()).toJson(QJsonDocument::Compact));
+}
+
+int SettingsBridge::getSystemCertCount() {
+    return CertificateManager::systemCertificateCount();
+}
+
+void SettingsBridge::toggleUseSystemCerts(bool enabled) {
+    CertificateManager::setUseSystemStoreEnabled(enabled);
+}
+
+void SettingsBridge::openSystemCertStore() {
+#ifdef Q_OS_WIN
+    // certmgr.msc — не самостоятельный .exe, поэтому запускается через mmc,
+    // который сам найдёт оснастку в System32 по имени.
+    QProcess::startDetached("mmc.exe", QStringList() << "certmgr.msc");
+#else
+    QMessageBox::information(mw, u8"Недоступно",
+        u8"Управление системным хранилищем сертификатов доступно только на Windows.");
+#endif
+}
+
+QString SettingsBridge::importCertificateFile() {
+    QString path = QFileDialog::getOpenFileName(mw, u8"Установить сертификат",
+        QString(), u8"Сертификаты (*.cer *.crt *.pem);;Все файлы (*.*)");
+    if (path.isEmpty()) {
+        return QString(); // пользователь отменил выбор — не ошибка
+    }
+    return CertificateManager::importCertificateFromFile(path);
+}
+
+void SettingsBridge::removeCertificate(const QString& id) {
+    CertificateManager::removeCustomCertificate(id);
+}
+
 void SettingsBridge::showPasswordManager() {
     mw->showPasswordManager();
 }
@@ -198,6 +427,112 @@ void SettingsBridge::resetPasswordVault() {
 
 void SettingsBridge::importPasswords() {
     mw->importPasswords();
+}
+
+QString SettingsBridge::getSavedAddressesJson() {
+    QJsonDocument doc = QJsonDocument::fromJson(QSettings().value("autofill/addresses").toByteArray());
+    QJsonArray arr = doc.isArray() ? doc.array() : QJsonArray();
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void SettingsBridge::addSavedAddress(const QString& fullName, const QString& phone, const QString& email,
+    const QString& addressLine, const QString& city, const QString& zip) {
+    // Хотя бы одно поле должно быть заполнено, иначе в списке появится
+    // видимая пустая строка без возможности понять, что это за запись.
+    if (fullName.trimmed().isEmpty() && phone.trimmed().isEmpty() && email.trimmed().isEmpty()
+        && addressLine.trimmed().isEmpty() && city.trimmed().isEmpty() && zip.trimmed().isEmpty()) {
+        return;
+    }
+
+    QSettings s;
+    QJsonDocument doc = QJsonDocument::fromJson(s.value("autofill/addresses").toByteArray());
+    QJsonArray arr = doc.isArray() ? doc.array() : QJsonArray();
+
+    QJsonObject obj;
+    obj["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    obj["fullName"] = fullName.trimmed();
+    obj["phone"] = phone.trimmed();
+    obj["email"] = email.trimmed();
+    obj["addressLine"] = addressLine.trimmed();
+    obj["city"] = city.trimmed();
+    obj["zip"] = zip.trimmed();
+    arr.append(obj);
+
+    s.setValue("autofill/addresses", QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void SettingsBridge::removeSavedAddress(const QString& id) {
+    if (id.trimmed().isEmpty()) return;
+
+    QSettings s;
+    QJsonDocument doc = QJsonDocument::fromJson(s.value("autofill/addresses").toByteArray());
+    QJsonArray arr = doc.isArray() ? doc.array() : QJsonArray();
+
+    QJsonArray filtered;
+    for (const QJsonValue& v : arr) {
+        if (v.toObject().value("id").toString() != id) filtered.append(v);
+    }
+    s.setValue("autofill/addresses", QJsonDocument(filtered).toJson(QJsonDocument::Compact));
+}
+
+void SettingsBridge::toggleOfferSaveAddress(bool enabled) {
+    QSettings().setValue("autofill/offer_save_address", enabled);
+}
+
+void SettingsBridge::checkPasswordsForBreaches() {
+    QJsonArray passwords = mw->getPasswordManager()->getAllDecrypted();
+
+    if (passwords.isEmpty()) {
+        // Пусто может значить и "паролей правда нет", и "хранилище заперто"
+        // (getAllDecrypted() молча возвращает пусто, если мастер-пароль ещё
+        // не вводили в этой сессии) — отличаем по счётчику записей.
+        bool locked = mw->getPasswordManager()->getPasswordCount() > 0;
+        emit passwordBreachCheckResult(QString::fromUtf8(QJsonDocument(QJsonArray()).toJson(QJsonDocument::Compact)), locked);
+        return;
+    }
+
+    // shared_ptr — чтобы пережить каждую отдельную асинхронную лямбду ниже
+    // и корректно посчитать, когда завершились ВСЕ запросы (по одному на
+    // пароль, могут прийти в любом порядке).
+    auto results = std::make_shared<QJsonArray>();
+    auto remaining = std::make_shared<int>(passwords.size());
+    auto* manager = new QNetworkAccessManager(mw);
+
+    for (const QJsonValue& v : passwords) {
+        QJsonObject entry = v.toObject();
+        QString password = entry.value("password").toString();
+
+        // k-anonymity: отправляем только первые 5 символов SHA-1 хэша пароля —
+        // ни сам пароль, ни его полный хэш никуда не уходят.
+        QByteArray sha1 = QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Sha1).toHex().toUpper();
+        QString prefix = QString::fromLatin1(sha1.left(5));
+        QString suffix = QString::fromLatin1(sha1.mid(5));
+
+        QNetworkReply* reply = manager->get(QNetworkRequest(QUrl("https://api.pwnedpasswords.com/range/" + prefix)));
+        connect(reply, &QNetworkReply::finished, this, [this, reply, suffix, entry, results, remaining, manager]() {
+            if (reply->error() == QNetworkReply::NoError) {
+                QString body = QString::fromUtf8(reply->readAll());
+                const QStringList lines = body.split("\r\n", Qt::SkipEmptyParts);
+                for (const QString& line : lines) {
+                    QStringList parts = line.split(':');
+                    if (parts.size() == 2 && parts[0].compare(suffix, Qt::CaseInsensitive) == 0) {
+                        QJsonObject breach;
+                        breach["site"] = entry.value("site_url").toString();
+                        breach["login"] = entry.value("login").toString();
+                        breach["count"] = parts[1].toInt();
+                        results->append(breach);
+                        break;
+                    }
+                }
+            }
+            reply->deleteLater();
+
+            if (--(*remaining) <= 0) {
+                emit passwordBreachCheckResult(QString::fromUtf8(QJsonDocument(*results).toJson(QJsonDocument::Compact)), false);
+                manager->deleteLater();
+            }
+            });
+    }
 }
 
 QString SettingsBridge::chooseDownloadFolder() {
@@ -232,6 +567,13 @@ QString SettingsBridge::getSettingsSnapshotJson() {
     obj["cloudLoggedIn"] = s.value("profile/is_logged_in", false).toBool();
     obj["cloudUsername"] = s.value("sync/username", "").toString();
     obj["minimizeToTray"] = s.value("browser/minimize_to_tray", false).toBool();
+    obj["useSystemCerts"] = CertificateManager::useSystemStoreEnabled();
+    obj["proxyConnected"] = ProxyManager::isConnected();
+    obj["sidebarVisible"] = mw->isSidebarVisible();
+    obj["sidebarPosition"] = s.value("browser/sidebar_position", "left").toString();
+    obj["httpsOnly"] = s.value("browser/https_only", false).toBool();
+    obj["clearSiteDataOnClose"] = s.value("browser/clear_site_data_on_close", false).toBool();
+    obj["offerSaveAddress"] = s.value("autofill/offer_save_address", true).toBool();
     return QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
 }
 
@@ -290,9 +632,14 @@ void SettingsBridge::testAiConnection(const QString& backend, const QString& key
         req.setRawHeader("Accept", "application/json");
         req.setRawHeader("RqUID", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8());
         req.setRawHeader("Authorization", ("Basic " + trimmedKey).toUtf8());
-        QSslConfiguration sslConf = req.sslConfiguration();
-        sslConf.setPeerVerifyMode(QSslSocket::VerifyNone); // как и в основном AI-чате — особенность серверов GigaChat
-        req.setSslConfiguration(sslConf);
+        // Раньше здесь стоял QSslSocket::VerifyNone (полное отключение проверки
+        // сертификата) — сервер GigaChat использует TLS-сертификат, выпущенный
+        // НУЦ Минцифры, которому Qt/ОС не доверяют "из коробки". Теперь, когда
+        // у CertificateManager есть встроенные корневые сертификаты Минцифры,
+        // используем нормальную проверку с расширенным списком доверенных CA
+        // вместо полного отключения — запрос по-прежнему отклонит настоящий
+        // MITM-сертификат, а не примет вообще любой.
+        req.setSslConfiguration(CertificateManager::trustedSslConfiguration());
 
         QNetworkReply* reply = manager->post(req, QByteArray("scope=GIGACHAT_API_PERS"));
         connect(reply, &QNetworkReply::finished, this, [this, reply, manager]() {
