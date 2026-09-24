@@ -37,20 +37,29 @@ namespace {
         historyMenu->addAction(u8"🕒 Показать историю", [mw]() { mw->showHistory(); });
         historyMenu->addAction(u8"🧹 Очистить историю", [mw]() { mw->clearHistory(); });
 
-        root->addSeparator();
-        root->addAction(u8"📥 Загрузки", [mw]() { mw->openDownloads(); });
+        // Недавно закрытые — список только в памяти (см. MainWindow::recordClosedTab()),
+        // поэтому здесь просто читаем его заново при каждом открытии меню, как и
+        // остальное содержимое populateMenu().
+        QStringList recentlyClosed = mw->recentlyClosedUrls();
+        if (!recentlyClosed.isEmpty()) {
+            historyMenu->addSeparator();
+            for (const QString& url : recentlyClosed) {
+                QUrl u(url);
+                // Показываем хост, если получится, иначе саму ссылку целиком
+                // (например, для storm://... внутренних страниц).
+                QString label = u.host().isEmpty() ? url : u.host();
+                historyMenu->addAction(u8"↩️ " + label, [mw, url]() {
+                    mw->reopenClosedTab(QUrl(url));
+                    });
+            }
+        }
 
         root->addSeparator();
-
-
-        // "Боковая панель" — отдельная кнопка сразу под "Вид"
-        // Важно: панель меню пересоздаётся с нуля при каждом клике по
-        // гамбургер-кнопке (см. MenuBuilder::buildMenu), поэтому начальное
-        // состояние галочки нужно брать из реальной видимости sidebar,
-        // а не хардкодить — иначе галочка и панель расходятся местами.
-        root->addCheckable(u8"📊 Боковая панель", mw->isSidebarVisible(), [mw](bool) {
-            mw->toggleSidebar();
-            }, false); // false = не закрывать меню при переключении
+        // Раньше это открывало мини-попап загрузок (mw->openDownloads()) — теперь,
+        // как и пункт "Закладки" выше, ведёт на полноценную страницу со всей
+        // историей сразу (и обычные, и торренты). Сам попап никуда не делся —
+        // он всё так же открывается кнопкой на тулбаре и по Ctrl+J.
+        root->addAction(u8"📥 Загрузки", [mw]() { mw->addNewTab(QUrl("storm://downloads")); });
 
         root->addSeparator();
 

@@ -296,12 +296,16 @@ void MainWindow::takeScreenshot() {
 
 
 void MainWindow::openDownloads() {
+    // Раньше: вручную setVisible(!isVisible()) + синхронизация checked-
+    // состояния кнопки на тулбаре. Теперь DownloadManager — всплывающее окно
+    // (Qt::Popup), а не боковая панель (см. DownloadManager.h/.cpp) —
+    // togglePopup() сам решает, открыть его у сохранённого якоря (см.
+    // downloadManager->setAnchorWidget(topBar->getDownloadsButton()) в
+    // MainWindow::setupUi()) или спрятать, если уже открыт. Ручной
+    // btnDownloads->setChecked() тоже больше не нужен: его по Show/Hide
+    // событиям попапа уже делает DownloadsPanelVisibilityFilter.
     if (downloadManager) {
-        downloadManager->setVisible(!downloadManager->isVisible());
-
-        if (topBar && topBar->getDownloadsButton()) {
-            topBar->getDownloadsButton()->setChecked(downloadManager->isVisible());
-        }
+        downloadManager->togglePopup();
     }
 }
 

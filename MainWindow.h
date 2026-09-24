@@ -5,6 +5,7 @@
 #include <QPointer>
 #include <QWebEngineView>
 #include <QSystemTrayIcon>
+#include <QStringList>
 #include "BrowserTopBar.h"
 #include "DatabaseManager.h"
 #include "Sidebar.h"
@@ -48,6 +49,23 @@ public:
     // Раньше индикатор вообще не обновлялся при выключении — всегда
     // показывал "Активен" независимо от реального состояния.
     void updateShieldStatusIndicator(bool enabled);
+
+    // Переставляет боковую панель (sidebar) в рабочей области — "left" (по
+    // умолчанию, слева от вкладок) или "right" (справа от вкладок, но левее
+    // выезжающей панели загрузок). Сохраняет выбор в QSettings
+    // ("browser/sidebar_position"), чтобы позиция восстанавливалась при
+    // следующем запуске. Вызывается из SettingsBridge::setSidebarPosition()
+    // (Настройки → Вид), а также один раз из setupUi() при старте, чтобы
+    // применить ранее сохранённое положение.
+    void setSidebarPosition(const QString& position);
+
+    // Недавно закрытые вкладки — для пункта "🕒 История" в гамбургер-меню
+    // (см. MenuBuilder.cpp) и восстановления по Ctrl+Shift+T. Список только в
+    // памяти (не переживает перезапуск браузера, как и в большинстве
+    // браузеров), самый свежий — в начале, максимум 15 штук. Заполняется из
+    // MainWindow::closeTab() (см. MainWindow_Tabs.cpp).
+    void recordClosedTab(const QUrl& url);
+    QStringList recentlyClosedUrls() const { return m_recentlyClosedUrls; }
 
     // Показывает системное уведомление через ОБЩУЮ, постоянную иконку в трее
     // (см. m_trayIcon ниже), а не через отдельный QSystemTrayIcon, который
@@ -131,6 +149,13 @@ public slots:
     void setAsDefaultBrowser();
     void toggleBookmarksBar();
 
+    // Восстановление вкладок из recentlyClosedUrls() — reopenClosedTab()
+    // используется пунктами меню (конкретный URL из списка), а
+    // reopenLastClosedTab() — шорткатом Ctrl+Shift+T (всегда самый верхний,
+    // то есть последний закрытый).
+    void reopenClosedTab(const QUrl& url);
+    void reopenLastClosedTab();
+
     void toggleShieldException();
     void setNewTabBackground();
     void showStartupSettings();
@@ -168,6 +193,12 @@ private:
     void setupTrayIcon();
 
     void performFindBarSearch(bool backward, bool resetHighlight);
+
+    // Куки не за которых нет в списке исключений удаляются на СЛЕДУЮЩЕМ
+    // старте (см. подробное объяснение у SettingsBridge::toggleClearSiteDataOnClose
+    // в SettingsBridge.h) — вызывается один раз из setupUi(), если в
+    // QSettings стоит флаг "session/pending_site_data_cleanup".
+    void runSiteDataCleanup(const QStringList& exceptions);
 
     bool isCurrentPageShieldExcepted();
     PasswordManager* passwordManager;
@@ -211,6 +242,10 @@ private:
     // сигнал closeEvent()'у, что это настоящий выход, а не обычное закрытие
     // окна, даже если включена настройка "сворачивать в трей".
     bool m_isQuitting = false;
+
+    // Недавно закрытые вкладки — см. recordClosedTab()/recentlyClosedUrls()
+    // выше. Самый свежий URL — в начале списка (index 0).
+    QStringList m_recentlyClosedUrls;
 
 protected:
     void closeEvent(QCloseEvent* event) override;

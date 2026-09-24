@@ -83,6 +83,9 @@
 #include <QWebEnginePage>
 #include "AdblockManager.h"
 #include "ShieldInterceptor.h"
+#include <QWebEngineUrlRequestInterceptor>
+#include <QWebEngineUrlRequestInfo>
+#include <QNetworkCookie>
 #include <QStatusBar> 
 #include <QWebEngineScript>
 #include <QWebEngineScriptCollection>
@@ -124,7 +127,7 @@
 // MainWindow_Settings.cpp и MainWindow_View.cpp — см. их шапки.
 // Классы-фильтры событий, используемые только внутри setupUi(),
 // остались локальными здесь же. WindowDragFilter и applyMediaCodecFix
-// нужны ещё и другим файлам — они в MainWindow_UiHelpers.h.
+// нужны ещё и другим файлам — в MainWindow_UiHelpers.h.
 // ==========================================================================
 
 // =========================================================================
@@ -383,6 +386,48 @@ public:
 };
 
 
+namespace {
+    // "HTTPS-only" (Настройки → Конфиденциальность): пытаемся поднять любую
+    // основную навигацию до https ДО того, как запрос вообще уйдёт в сеть.
+    // QWebEngineProfile принимает только один interceptor, а Shield уже его
+    // занимает — поэтому не заменяем ShieldInterceptor, а оборачиваем: сначала
+    // пробуем апгрейд, и только если его не случилось — передаём запрос дальше,
+    // как раньше. Как и аппаратное ускорение, читает настройку один раз при
+    // создании (m_enabled) и требует перезапуска браузера для применения.
+    //
+    // Ограничение (сознательно, чтобы не усложнять): если у сайта в принципе
+    // нет https-версии, реального отката на http с предупреждением, как в
+    // настоящих браузерах, здесь нет — страница просто не загрузится по
+    // https. Полноценный интерстишл потребовал бы реакции на неудачную
+    // загрузку (loadFinished(false)) там, где создаются сами вкладки — этого
+    // кода в MainWindow.cpp нет (см. пояснение в чате).
+    class HttpsUpgradeInterceptor : public QWebEngineUrlRequestInterceptor {
+    public:
+        HttpsUpgradeInterceptor(QWebEngineUrlRequestInterceptor* inner, bool enabled, QObject* parent)
+            : QWebEngineUrlRequestInterceptor(parent), m_inner(inner), m_enabled(enabled) {
+        }
+
+        void interceptRequest(QWebEngineUrlRequestInfo& info) override {
+            // Маска Firefox только для страниц входа Google — см.
+            // MainWindow_UiHelpers.h. Стоит ДО Shield, чтобы работать и
+            // при выключенном Shield / исключениях.
+            applyGoogleLoginUserAgent(info);
+            if (m_enabled && info.requestUrl().scheme() == QLatin1String("http")
+                && info.resourceType() == QWebEngineUrlRequestInfo::ResourceTypeMainFrame) {
+                QUrl httpsUrl = info.requestUrl();
+                httpsUrl.setScheme("https");
+                info.redirect(httpsUrl);
+                return; // не даём Shield ещё раз обработать уже перенаправленный запрос
+            }
+            if (m_inner) m_inner->interceptRequest(info);
+        }
+
+    private:
+        QWebEngineUrlRequestInterceptor* m_inner;
+        bool m_enabled;
+    };
+} // namespace
+
 MainWindow::MainWindow(QWidget* parent, bool isDetached)
     : QMainWindow(parent), topBar(nullptr), tabWidget(nullptr), sidebar(nullptr), pageTemplates(this)
 {
@@ -456,10 +501,19 @@ void MainWindow::setupUi(bool isDetached) {
         m_mainProfile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
         m_mainProfile->cookieStore()->loadAllCookies();
 
-        QString firefoxUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
-        m_mainProfile->setHttpUserAgent(firefoxUa);
+        // См. подробности у SettingsBridge::toggleClearSiteDataOnClose (SettingsBridge.h):
+        // сама очистка отложена до сюда, а не делается прямо в closeEvent(), потому
+        // что там нет гарантии, что событийный цикл доживёт до конца асинхронного
+        // перебора куки.
+        if (!isDetached && QSettings().value("session/pending_site_data_cleanup", false).toBool()) {
+            QSettings().remove("session/pending_site_data_cleanup");
+            runSiteDataCleanup(QSettings().value("browser/site_data_exceptions").toStringList());
+        }
 
-        qCritical().noquote() << "[DIAG] Firefox User-Agent set to:" << firefoxUa;
+        const QString stormUa = stormUserAgentFor(m_mainProfile);
+        m_mainProfile->setHttpUserAgent(stormUa);
+
+        qCritical().noquote() << "[DIAG] User-Agent set to:" << stormUa;
         qWarning() << "[DIAG] isOffTheRecord:" << m_mainProfile->isOffTheRecord();
         qWarning() << "[DIAG] Cache path:" << m_mainProfile->cachePath();
         qWarning() << "[DIAG] Storage path:" << m_mainProfile->persistentStoragePath();
@@ -479,11 +533,13 @@ void MainWindow::setupUi(bool isDetached) {
         mainInterceptor->setExceptions(shieldSettings.value("shield/exceptions").toStringList());
     }
 
-    m_mainProfile->setUrlRequestInterceptor(mainInterceptor);
+    m_mainProfile->setUrlRequestInterceptor(
+        new HttpsUpgradeInterceptor(mainInterceptor, QSettings().value("browser/https_only", false).toBool(), this));
 
     AdblockManager::instance().init(m_mainProfile, nullptr);
 
     applyMediaCodecFix(m_mainProfile);
+    applyGoogleLoginUaScript(m_mainProfile);
     // =========================================================
     // --- СТЕЛС-СКРИПТ ДЛЯ СКРЫТИЯ ВЕРХНЕЙ ПАНЕЛИ ПЕРЕВОДЧИКА ---
     // =========================================================
@@ -589,13 +645,36 @@ void MainWindow::setupUi(bool isDetached) {
 
     workLayout->addWidget(tabWidget, 1);
 
+    // downloadManager раньше жил внутри workLayout как пристыкованная боковая
+    // панель (workLayout->addWidget(downloadManager)) — теперь это всплывающее
+    // окно (Qt::Popup, см. DownloadManager.h/.cpp), поэтому в раскладку рабочей
+    // области он больше не добавляется вообще, только конструируется.
     downloadManager = new DownloadManager(this);
     downloadManager->hide();
-    workLayout->addWidget(downloadManager);
+
+    // Слева по умолчанию — так и было раньше, до появления самого выбора
+    // положения (Настройки → Вид → Боковая панель).
+    setSidebarPosition(QSettings().value("browser/sidebar_position", "left").toString());
 
     if (topBar && topBar->getDownloadsButton()) {
         downloadManager->installEventFilter(new DownloadsPanelVisibilityFilter(topBar->getDownloadsButton(), this));
+        // Даёт DownloadManager якорь для popupBelow() — так и явные open-вызовы
+        // (Ctrl+J/меню, чьи слоты объявлены, но не в этих файлах), и
+        // автопоказ при старте новой загрузки (addDownload()/addTorrent())
+        // открывают попап у кнопки на тулбаре, а не в произвольном месте экрана.
+        downloadManager->setAnchorWidget(topBar->getDownloadsButton());
     }
+
+    // Кнопка "📂 Все загрузки" в футере попапа — раньше DownloadManager сам
+    // делал qobject_cast<MainWindow*>(parentWidget())->addNewTab(...), для
+    // чего его .cpp пришлось включить "MainWindow.h"; а MainWindow.h сам
+    // включает DownloadManager.h — это обратное включение спровоцировало
+    // C1014 (глубина включений 1024). Теперь DownloadManager просто шлёт
+    // сигнал, ничего не зная про MainWindow — единственное место, которое
+    // решает, что делать по этому сигналу, вот здесь.
+    connect(downloadManager, &DownloadManager::allDownloadsRequested, this, [this]() {
+        addNewTab(QUrl("storm://downloads"));
+        });
 
     connect(m_mainProfile, &QWebEngineProfile::downloadRequested, this, [this](QWebEngineDownloadRequest* request) {
         downloadManager->addDownload(request);
@@ -606,13 +685,6 @@ void MainWindow::setupUi(bool isDetached) {
     AIAssistantWidget* aiWidget = new AIAssistantWidget(this);
     aiAssistantWidget = aiWidget;
     sidebar->addItem(u8"🧠", u8"Storm AI", aiWidget);
-
-    connect(aiWidget, &AIAssistantWidget::panelActivationRequested, this, [this]() {
-        if (sidebar) {
-            sidebar->setVisible(true);
-            sidebar->openItem(aiAssistantWidget);
-        }
-        });
 
     NotesWidget* notesWidget = new NotesWidget(this);
     sidebar->addItem(u8"📝", u8"Заметки", notesWidget);
@@ -672,11 +744,6 @@ void MainWindow::setupUi(bool isDetached) {
 
     SmmAutoPublisherWidget* smmWidget = new SmmAutoPublisherWidget(this);
     sidebar->addItem(u8"📅", u8"SMM Авто-постинг", smmWidget);
-    // Доводит очередь до реальной публикации: открывает фоновую вкладку
-    // платформы и запускает на ней WebPageAgent. Пока умеет дойти только до
-    // capturePageContext() — конкретной последовательности click/type для
-    // отправки поста ещё нет, см. подробный комментарий в
-    // SmmPublishController.cpp про недостающий цикл принятия решений.
     smmPublishController = new SmmPublishController(this, smmWidget->queueManager(), this);
 
     connect(tabWidget->tabBar(), &QTabBar::tabCloseRequested, this, &MainWindow::closeTab);
@@ -733,6 +800,9 @@ void MainWindow::setupUi(bool isDetached) {
     QShortcut* downloadsShortcut = new QShortcut(QKeySequence("Ctrl+J"), this);
     connect(downloadsShortcut, &QShortcut::activated, this, &MainWindow::openDownloads);
 
+    QShortcut* reopenClosedTabShortcut = new QShortcut(QKeySequence("Ctrl+Shift+T"), this);
+    connect(reopenClosedTabShortcut, &QShortcut::activated, this, &MainWindow::reopenLastClosedTab);
+
     auto focusAddressBar = [this]() {
         topBar->getAddressBar()->setFocus();
         topBar->getAddressBar()->selectAll();
@@ -776,9 +846,6 @@ void MainWindow::setupUi(bool isDetached) {
     QShortcut* findShortcut = new QShortcut(QKeySequence("Ctrl+F"), this);
     connect(findShortcut, &QShortcut::activated, this, &MainWindow::showFindBar);
 
-    // F12 — DevTools (тело вынесено в openDevTools(), см. ниже — тот же
-    // метод теперь переиспользует и "🔍 Просмотреть код" из контекстного
-    // меню в BrowserWebView.cpp)
     QShortcut* devToolsShortcut = new QShortcut(QKeySequence("F12"), this);
     connect(devToolsShortcut, &QShortcut::activated, this, [this]() {
         auto* currentView = qobject_cast<QWebEngineView*>(tabWidget->currentWidget());
@@ -788,9 +855,6 @@ void MainWindow::setupUi(bool isDetached) {
     MenuBuilder::buildMenu(this);
     loadBookmarksIntoMenu();
 
-    // =========================================================
-    // --- Фоновая проверка обновлений (только для главного окна) ---
-    // =========================================================
     if (!isDetached) {
         UpdateManager* autoUpdater = new UpdateManager(this);
         autoUpdater->setObjectName("UpdateManager");
@@ -802,14 +866,6 @@ void MainWindow::setupUi(bool isDetached) {
         autoUpdater->startPeriodicChecks();
     }
 
-    // =========================================================
-    // --- Постоянная иконка в трее (только для главного окна) ---
-    // =========================================================
-    // Не привязана к конкретной функции — общий, всегда живой канал:
-    // closeEvent() ниже сворачивает сюда окно, если это включено в
-    // настройках, а showTrayNotification() доступен любому виджету
-    // приложения вместо того, чтобы каждый заводил свой QSystemTrayIcon
-    // (как сейчас делает разовое уведомление AntiSub в TodoWidget).
     if (!isDetached && QSystemTrayIcon::isSystemTrayAvailable()) {
         setupTrayIcon();
     }
@@ -833,8 +889,6 @@ void MainWindow::setupTrayIcon() {
 
     QAction* quitAction = trayMenu->addAction(u8"Выход");
     connect(quitAction, &QAction::triggered, this, [this]() {
-        // Настоящий выход: взводим флаг ДО close(), чтобы closeEvent() не
-        // свернул окно в трей повторно, даже если такая настройка включена.
         m_isQuitting = true;
         close();
         });
@@ -847,9 +901,6 @@ void MainWindow::setupTrayIcon() {
 
 
 void MainWindow::onTrayIconActivated(QSystemTrayIcon::ActivationReason reason) {
-    // Trigger — одиночный клик (в Windows это ЛКМ по иконке). DoubleClick
-    // добавлен на случай окружений, где одиночный клик не считается
-    // активацией — оба варианта просто разворачивают окно, без дублирования.
     if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick) {
         if (isHidden()) {
             show();
@@ -859,6 +910,93 @@ void MainWindow::onTrayIconActivated(QSystemTrayIcon::ActivationReason reason) {
     }
 }
 
+
+void MainWindow::setSidebarPosition(const QString& position) {
+    QSettings().setValue("browser/sidebar_position", position);
+    if (!sidebar) return;
+
+    // workLayout — локальная переменная в setupUi(), но она же и есть layout,
+    // установленный на родителе sidebar (workArea), поэтому достаём его отсюда,
+    // а не заводим отдельное поле-указатель только ради этого метода.
+    QWidget* workArea = sidebar->parentWidget();
+    if (!workArea) return;
+    QHBoxLayout* layout = qobject_cast<QHBoxLayout*>(workArea->layout());
+    if (!layout) return;
+
+    layout->removeWidget(sidebar);
+    if (position == "right") {
+        // downloadManager больше не в этой раскладке (теперь всплывающее
+        // окно, см. его конструирование выше в setupUi()) — раньше здесь
+        // сайдбар специально вставлялся левее него; сейчас в workLayout
+        // остаются только сайдбар и tabWidget, так что "справа" — это
+        // просто "в самый конец".
+        layout->insertWidget(layout->count(), sidebar);
+    }
+    else {
+        layout->insertWidget(0, sidebar);
+    }
+}
+
+void MainWindow::recordClosedTab(const QUrl& url) {
+    if (url.isEmpty() || url.toString() == "about:blank") return;
+
+    m_recentlyClosedUrls.removeAll(url.toString());
+    m_recentlyClosedUrls.prepend(url.toString());
+    // Не даём списку расти бесконечно — 15 достаточно, дальше пользователь
+    // уже вряд ли будет их искать в меню.
+    while (m_recentlyClosedUrls.size() > 15) {
+        m_recentlyClosedUrls.removeLast();
+    }
+}
+
+void MainWindow::reopenClosedTab(const QUrl& url) {
+    m_recentlyClosedUrls.removeAll(url.toString());
+    addNewTab(url);
+}
+
+void MainWindow::reopenLastClosedTab() {
+    if (m_recentlyClosedUrls.isEmpty()) return;
+    QUrl url(m_recentlyClosedUrls.takeFirst());
+    addNewTab(url);
+}
+
+void MainWindow::runSiteDataCleanup(const QStringList& exceptions) {
+    if (!m_mainProfile) return;
+    QWebEngineCookieStore* store = m_mainProfile->cookieStore();
+
+    auto isExcepted = [exceptions](QString domain) {
+        while (domain.startsWith('.')) domain.remove(0, 1);
+        for (const QString& ex : exceptions) {
+            if (domain.compare(ex, Qt::CaseInsensitive) == 0
+                || domain.endsWith("." + ex, Qt::CaseInsensitive)) {
+                return true;
+            }
+        }
+        return false;
+        };
+
+    // QWebEngineCookieStore не даёт синхронный список сохранённых куки —
+    // единственный документированный способ их перебрать: подписаться на
+    // cookieAdded() и вызвать loadAllCookies(), которая эмитит сигнал для
+    // каждой уже сохранённой куки (не только для новых). Подписка живёт
+    // на отдельном QObject, который сам себя удалит чуть позже — эмиссия
+    // происходит не мгновенно, а в течение текущего цикла событий.
+    auto* subscription = new QObject(this);
+    connect(store, &QWebEngineCookieStore::cookieAdded, subscription, [store, isExcepted](const QNetworkCookie& cookie) {
+        if (!isExcepted(cookie.domain())) {
+            store->deleteCookie(cookie);
+        }
+        });
+    store->loadAllCookies();
+    QTimer::singleShot(1000, subscription, [subscription]() { subscription->deleteLater(); });
+
+    // Кэш в публичном API профиля не делится по доменам, поэтому чистим его
+    // целиком — но только если исключений нет вообще, иначе оставленные
+    // сайты тоже лишились бы кэша.
+    if (exceptions.isEmpty()) {
+        m_mainProfile->clearHttpCache();
+    }
+}
 
 void MainWindow::showTrayNotification(const QString& title, const QString& message) {
     if (m_trayIcon) {
@@ -889,26 +1027,12 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     UpdateManager* updater = this->findChild<UpdateManager*>("UpdateManager");
     if (updater && updater->isUpdateStaged()) {
         qDebug() << "🔄 Запуск установки скачанного обновления перед выходом...";
-        // applyStagedUpdateAndRestart() теперь возвращает false, если
-        // обновление на самом деле не запустилось (например, скачанный
-        // установщик оказался повреждён — не совпал хэш). Раньше в этом
-        // редком случае мы всё равно безусловно "проглатывали" закрытие
-        // окна (event->ignore()), и пользователю приходилось нажимать
-        // крестик второй раз без какого-либо объяснения. Теперь при
-        // неудаче просто продолжаем закрываться как обычно, без апдейта.
         if (updater->applyStagedUpdateAndRestart()) {
             event->ignore();
             return;
         }
     }
 
-    // Сворачивание в трей вместо закрытия — только для главного окна
-    // (детач-окна всегда закрываются как обычно), только если m_trayIcon
-    // вообще создан (см. setupTrayIcon()), только если это НЕ настоящий
-    // выход через пункт "Выход" трей-меню (m_isQuitting), и только если
-    // пользователь явно включил это в настройках (browser/minimize_to_tray,
-    // см. SettingsBridge::toggleMinimizeToTray). По умолчанию выключено —
-    // у существующих пользователей поведение окна не меняется само по себе.
     if (!m_isQuitting && !property("isDetachedWindow").toBool() && m_trayIcon
         && QSettings().value("browser/minimize_to_tray", false).toBool()) {
         event->ignore();
@@ -919,15 +1043,18 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         return;
     }
 
+    // Реальное закрытие (не сворачивание в трей) — если включена очистка
+    // данных сайтов, помечаем это на следующий старт (см. runSiteDataCleanup()
+    // и подробное объяснение почему не прямо здесь — у
+    // SettingsBridge::toggleClearSiteDataOnClose в SettingsBridge.h).
+    if (!property("isDetachedWindow").toBool()
+        && QSettings().value("browser/clear_site_data_on_close", false).toBool()) {
+        QSettings().setValue("session/pending_site_data_cleanup", true);
+    }
+
     event->accept();
 }
 
-
-// ==========================================================================
-// DevTools / Storm Shield — вызывается из F12 (см. setupUi()) и из пунктов
-// "🔍 Просмотреть код" / "🚫 Заблокировать элемент" контекстного меню
-// (BrowserWebView::contextMenuEvent).
-// ==========================================================================
 
 void MainWindow::openDevTools(QWebEngineView* view, bool forceShow) {
     if (!view || !view->page()) return;
@@ -981,10 +1108,6 @@ void MainWindow::openDevTools(QWebEngineView* view, bool forceShow) {
 
     m_devToolsWindow->setStyleSheet(this->styleSheet());
 
-    // F12 по-прежнему тоггл-переключает окно (forceShow=false). Вызов из
-    // "Просмотреть код" всегда должен ПОКАЗЫВАТЬ DevTools, а не прятать их,
-    // если окно вдруг уже было открыто — иначе повторный правый клик на
-    // другом элементе "закрывал" бы DevTools вместо перехода к нему.
     if (m_devToolsWindow->isVisible() && !forceShow) {
         m_devToolsWindow->hide();
         return;
@@ -1025,12 +1148,6 @@ void MainWindow::inspectElementAt(QWebEngineView* view) {
     if (!view || !view->page()) return;
 
     openDevTools(view, /*forceShow=*/true);
-
-    // InspectElement у QWebEnginePage триггерится по координатам ПОСЛЕДНЕГО
-    // запроса контекстного меню на этой странице — Chromium сам помнит, по
-    // какому узлу кликнули, когда наше кастомное меню строилось в
-    // BrowserWebView::contextMenuEvent(). Поэтому вызов идёт сразу же,
-    // без задержек — пока Chromium ещё помнит клик.
     view->page()->triggerAction(QWebEnginePage::InspectElement);
 }
 
@@ -1043,9 +1160,6 @@ void MainWindow::blockElementAt(QWebEngineView* view, const QPoint& pos) {
             const el = document.elementFromPoint(%1, %2);
             if (!el) return null;
 
-            // От мелких инлайновых узлов (span/img/a внутри карточки)
-            // поднимаемся на пару уровней вверх — реклама/баннер почти
-            // всегда это контейнер-обёртка, а не сама картинка/текст.
             let target = el;
             const tiny = new Set(['SPAN', 'IMG', 'A', 'B', 'I', 'STRONG', 'EM']);
             let hops = 0;
@@ -1077,7 +1191,7 @@ void MainWindow::blockElementAt(QWebEngineView* view, const QPoint& pos) {
     QPointer<QWebEngineView> viewGuard(view);
 
     view->page()->runJavaScript(js, [self, viewGuard](const QVariant& result) {
-        if (!self || !viewGuard) return; // вкладка/окно могли закрыться, пока летел JS
+        if (!self || !viewGuard) return;
 
         QString json = result.toString();
         if (json.isEmpty() || json == "null") {
@@ -1090,13 +1204,6 @@ void MainWindow::blockElementAt(QWebEngineView* view, const QPoint& pos) {
         QString host = viewGuard->url().host().toLower();
         if (selector.isEmpty() || host.isEmpty()) return;
 
-        // Кастомный фреймлесс-диалог вместо QInputDialog::getText() — у
-        // системного QInputDialog белая ОС-рамка, которая выбивается из
-        // тёмной темы браузера. Заголовок сделан по тому же образцу, что и
-        // у окна DevTools (customTitleBar/customTitleLabel/titleCloseBtn +
-        // WindowDragFilter для перетаскивания) — эти имена объектов уже
-        // стилизуются текущей темой через общий QSS, поэтому просто
-        // наследуем self->styleSheet() и рамка сама совпадёт с браузером.
         QDialog dlg(self);
         dlg.setWindowFlags(Qt::FramelessWindowHint | Qt::Dialog);
         dlg.setStyleSheet(self->styleSheet());
@@ -1167,9 +1274,6 @@ void MainWindow::blockElementAt(QWebEngineView* view, const QPoint& pos) {
 
         AdblockManager::instance().addCustomHideSelector(host, finalSelector);
 
-        // Прячем сразу на открытой странице, не дожидаясь перезагрузки —
-        // сохранённое правило само подхватится на следующих заходах через
-        // applyCosmeticAndStealthScripts().
         QString escaped = finalSelector;
         escaped.replace("\\", "\\\\").replace("'", "\\'");
         QString hideNowJs = QString(

@@ -48,6 +48,8 @@
 #include "CustomMenuPanel.h"
 #include "BookmarksBridge.h"
 #include "BookmarksPageHtml.h"
+#include "DownloadsBridge.h"
+#include "DownloadsPageHtml.h"
 #include <QtAlgorithms>
 #include "BrowserWebView.h"
 #include "TabSpinner.h"
@@ -71,6 +73,8 @@
 #include "DownloadManager.h"
 #include "FernetCrypto.h"
 #include "StormWebPage.h"
+#include "CertificateManager.h"
+#include <QWebEngineCertificateError>
 #include <QRadioButton>
 #include <QDialogButtonBox>
 #include <QStandardPaths>
@@ -141,8 +145,11 @@ void MainWindow::addNewTab(const QUrl& url, bool isIncognito) {
         profile->setSpellCheckLanguages(QStringList() << "en-US" << "ru-RU");
 
         applyMediaCodecFix(profile);
-        QString firefoxUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
-        profile->setHttpUserAgent(firefoxUa);
+        profile->setHttpUserAgent(stormUserAgentFor(profile));
+        // У приватного профиля нет своего interceptor — ставим минимальный,
+        // чтобы и здесь работала маска Firefox на страницах входа Google.
+        profile->setUrlRequestInterceptor(new GoogleLoginUaInterceptor(profile));
+        applyGoogleLoginUaScript(profile);
     }
     else {
         profile = m_mainProfile;
@@ -156,7 +163,24 @@ void MainWindow::addNewTab(const QUrl& url, bool isIncognito) {
     StormWebPage* page = new StormWebPage(profile, this, view);
     view->setPage(page);
 
-    connect(page, &QWebEnginePage::featurePermissionRequested, this, [page](const QUrl& securityOrigin, QWebEnginePage::Feature feature) {
+    // Доверие сертификатам Минцифры России (+ Windows/свои, если включены
+    // в настройках) — см. CertificateManager.h. Chromium уже проверил
+    // цепочку криптографически до этого сигнала; certificateError() зовётся
+    // только когда её корень не входит в Chrome Root Store. Если корень
+    // (или любой сертификат цепочки) совпадает с одним из наших доверенных —
+    // принимаем сами; иначе ничего не делаем — Chromium как и раньше покажет
+    // пользователю штатный экран предупреждения (если error.isOverridable()).
+    // Один коннект на КАЖДУЮ вкладку (page создаётся здесь заново для
+    // каждой), поэтому подключаем сразу тут же, а не централизованно на
+    // уровне профиля — у QWebEnginePage нет profile-level хука для этого.
+    connect(page, &QWebEnginePage::certificateError, this,
+        [](QWebEngineCertificateError error) {
+            if (CertificateManager::chainTrustedByUs(error.certificateChain())) {
+                error.acceptCertificate();
+            }
+        });
+
+    connect(page, &QWebEnginePage::featurePermissionRequested, this, [this, page](const QUrl& securityOrigin, QWebEnginePage::Feature feature) {
         // БАГФИКС: раньше здесь разрешался ТОЛЬКО ClipboardReadWrite, а вообще
         // всё остальное молча отклонялось — в том числе MediaAudioVideoCapture
         // (камера+микрофон) и DesktopVideoCapture/DesktopAudioVideoCapture
@@ -184,7 +208,14 @@ void MainWindow::addNewTab(const QUrl& url, bool isIncognito) {
             page->setFeaturePermission(securityOrigin, feature, QWebEnginePage::PermissionGrantedByUser);
         }
         else {
-            page->setFeaturePermission(securityOrigin, feature, QWebEnginePage::PermissionDeniedByUser);
+            // Раньше здесь было безусловное PermissionDeniedByUser для ВСЕГО
+            // остального — то есть обычные сайты никогда не могли получить
+            // камеру/микрофон/геолокацию/уведомления, даже если сами не
+            // предлагали спросить. Теперь настоящий диалог "Разрешить/
+            // Заблокировать" с запоминанием выбора по сайту (Настройки →
+            // Конфиденциальность → Разрешения сайтов), см.
+            // BrowserWebView::handlePermissionRequest().
+            BrowserWebView::handlePermissionRequest(page, this, securityOrigin, feature);
         }
         });
 
@@ -424,6 +455,18 @@ void MainWindow::addNewTab(const QUrl& url, bool isIncognito) {
 
         view->setHtml(getBookmarksHtml(), QUrl("http://storm.bookmarks"));
     }
+    else if (url.toString() == "storm://downloads") {
+        // Полноценная страница со ВСЕЙ историей загрузок сразу (и обычные, и
+        // торрент), в отличие от мини-попапа DownloadManager, который теперь
+        // открывается кнопкой на тулбаре (см. DownloadManager::popupBelow())
+        // и показывает только текущую сессию — см. DownloadsBridge.h.
+        QWebChannel* downloadsChannel = new QWebChannel(page);
+        DownloadsBridge* downloadsBridge = new DownloadsBridge(this, page);
+        downloadsChannel->registerObject("downloadsBridge", downloadsBridge);
+        page->setWebChannel(downloadsChannel);
+
+        view->setHtml(getDownloadsHtml(), QUrl("http://storm.downloads"));
+    }
     else if (url.toString() == "storm://help" || url.toString() == "storm://help/") {
         view->setHtml(getHelpHtml(), QUrl("http://storm.help"));
     }
@@ -502,6 +545,16 @@ void MainWindow::closeTab(int index) {
             tabWidget->setCurrentIndex(index - 1);
         }
         QWidget* widget = tabWidget->widget(index);
+
+        // Для "🕒 Недавно закрытые" (гамбургер-меню → История, Ctrl+Shift+T) —
+        // кроме инкогнито-вкладок, как и в обычных браузерах: приватная
+        // сессия не должна оставлять следов после закрытия.
+        if (auto* closedView = qobject_cast<QWebEngineView*>(widget)) {
+            if (closedView->page() && !closedView->page()->profile()->isOffTheRecord()) {
+                recordClosedTab(closedView->url());
+            }
+        }
+
         tabWidget->removeTab(index);
         delete widget;
     }

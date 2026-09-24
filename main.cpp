@@ -68,6 +68,10 @@ int main(int argc, char* argv[])
     // UserAgentClientHint ОЧЕНЬ ВАЖЕН при маскировке под Firefox: если мы
     // надели маску Firefox, мы категорически не должны отправлять Client
     // Hints от Chrome!
+    // UserAgentClientHint отключён ВСЕГДА: для страниц входа Google мы
+    // подменяем идентичность на Firefox (см. MainWindow_UiHelpers.h), а
+    // Sec-CH-UA заголовки Chromium выдали бы там подмену. Без Client Hints
+    // остальные сайты видят обычный Chrome-UA — это нормальная ситуация.
     QString originClusterFix = "OriginAgentClusterDefaultEnable,UserAgentClientHint";
 
     if (!useHwAccel) {
