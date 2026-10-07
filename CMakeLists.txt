@@ -36,7 +36,6 @@ find_package(Qt6 REQUIRED COMPONENTS
 find_package(OpenSSL REQUIRED)
 
 # Ищем библиотеки для торрентов
-
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
 
 # --- Сборка исполняемого файла ---
@@ -49,9 +48,6 @@ add_executable(StormBrowser WIN32
     # Основные окна и менеджеры
     MainWindow.cpp
     MainWindow.h
-    # MainWindow.cpp был ~2450 строк и рос дальше — разбит по темам,
-    # чтобы каждый файл отвечал за одну область браузера. Публичный
-    # интерфейс класса (MainWindow.h) не менялся, поведение то же самое.
     MainWindow_UiHelpers.h
     MainWindow_Navigation.cpp
     MainWindow_Tabs.cpp
@@ -67,6 +63,10 @@ add_executable(StormBrowser WIN32
     ScreenshotEditor.h
     DownloadManager.cpp
     DownloadManager.h
+    DownloadsBridge.cpp
+    DownloadsBridge.h
+    DownloadsPageHtml.h
+    DownloadsPageHtml.cpp
     StormCloud.cpp
     StormCloud.h
     StormWebPage.cpp
@@ -86,12 +86,16 @@ add_executable(StormBrowser WIN32
     AdblockManager.h
     ShieldInterceptor.cpp
     ShieldInterceptor.h
+    CertificateManager.h
+    CertificateManager.cpp
     HomeAIBridge.cpp
     HomeAIBridge.h
     HomeBridge.cpp
     HomeBridge.h
     BrowserWebView.h
     BrowserWebView.cpp
+    AnalyticsClient.h
+    AnalyticsClient.cpp
     TabSpinner.h
     TabSpinner.cpp
     CustomMenuPanel.h
@@ -167,11 +171,6 @@ add_executable(StormBrowser WIN32
     FernetCrypto.cpp
     PageTemplates.h
     PageTemplates.cpp
-    # PageTemplates.cpp был ~3690 строк (HTML/CSS/JS-шаблоны storm://cloud
-    # и storm://talk — самые большие). Каждый огромный шаблон разбит на
-    # 2 файла ровно по границе текста внутри строкового литерала — сам
-    # HTML/CSS/JS не менялся ни на символ. Публичный интерфейс класса
-    # (PageTemplates.h) не менялся 
     PageTemplates_Internal.h
     PageTemplates_Home.cpp
     PageTemplates_Cloud.cpp
@@ -189,9 +188,7 @@ add_executable(StormBrowser WIN32
     SettingsPageHtml.h
     SettingsPageHtml.cpp
 
-    # SMM Auto-Publisher — плагин-виджет боковой панели: локальный планировщик
-    # отложенных постов в соцсети (композитор + очередь на QTimer, публикация
-    # доводится MainWindow-ом через PostQueueManager::publishDue, см. историю).
+    # SMM Auto-Publisher
     SmmTypes.h
     PostQueueManager.h
     PostQueueManager.cpp
@@ -212,7 +209,6 @@ if(MSVC)
 endif()
 
 # --- Связывание библиотек --
-# Привязываем все необходимые библиотеки Qt и внешние пакеты к нашей цели
 target_link_libraries(StormBrowser PRIVATE
     Qt6::Core
     Qt6::Gui
@@ -230,28 +226,18 @@ target_link_libraries(StormBrowser PRIVATE
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/resources 
      DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
-# (Здесь раньше был первый вызов windeployqt — удалён: он использовал
-# ${WINDEPLOYQT_EXECUTABLE} ДО find_program(WINDEPLOYQT_EXECUTABLE ...)
-# ниже по файлу, то есть на этапе конфигурации CMake переменная ещё была
-# пустой, и каждая сборка гоняла COMMAND без имени программы. Реальный,
-# рабочий вызов windeployqt — ниже, после find_program(), с флагом
-# --no-translations.)
-
-# Автоматическое копирование папки system_core в папку с готовым исполняемым файлом
 add_custom_command(TARGET StormBrowser POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_CURRENT_SOURCE_DIR}/system_core"
     "$<TARGET_FILE_DIR:StormBrowser>/system_core"
 )
 
-# Автоматическое копирование словарей орфографии
 add_custom_command(TARGET StormBrowser POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_CURRENT_SOURCE_DIR}/qtwebengine_dictionaries"
     "$<TARGET_FILE_DIR:StormBrowser>/qtwebengine_dictionaries"
 )
 
-# 1. Копируем .pak файлы ресурсов (без них падает CrBrowserMain)
 add_custom_command(TARGET StormBrowser POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     "D:/Programs/Qt/6.9.3/msvc2022_64/resources"
@@ -259,7 +245,6 @@ add_custom_command(TARGET StormBrowser POST_BUILD
     COMMENT "Копирование pak-ресурсов WebEngine..."
 )
 
-# 2. Копируем локали Chromium (без папки locales и en-US.pak движок не стартует)
 add_custom_command(TARGET StormBrowser POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     "D:/Programs/Qt/6.9.3/msvc2022_64/translations/qtwebengine_locales"
@@ -267,22 +252,16 @@ add_custom_command(TARGET StormBrowser POST_BUILD
     COMMENT "Копирование локалей Chromium..."
 )
 
-# --- Автоматический деплой ресурсов Qt (windeployqt) ---
-# Находим путь к утилите windeployqt в вашей установке Qt
 find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "D:/Programs/Qt/6.9.3/msvc2022_64/bin")
 
-# Запускаем windeployqt для нашего экзешника после сборки
 add_custom_command(TARGET StormBrowser POST_BUILD
     COMMAND ${WINDEPLOYQT_EXECUTABLE} 
             --no-translations 
             --no-system-d3d-compiler 
             "$<TARGET_FILE:StormBrowser>"
     COMMENT "Running windeployqt to copy Qt WebEngine dependencies..."
-
-
 )
 
-# 3. Копируем библиотеки OpenSSL для корректной работы HTTPS
 add_custom_command(TARGET StormBrowser POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "D:/Programs/Qt/6.9.3/msvc2022_64/bin/libcrypto-3-x64.dll"

@@ -12,6 +12,11 @@ public:
 
     // Метод для обычного чата с ИИ
     Q_INVOKABLE void askAI(const QString& prompt);
+    // Принудительный режим «🌐 Поиск»: вопрос ВСЕГДА идёт через Tavily (ключ
+    // из настроек), затем ИИ формулирует ответ по найденным источникам. Без
+    // ключа/при недоступности Tavily — автоматический переход на страницу
+    // выдачи поисковика по умолчанию (см. performHomeSearch).
+    Q_INVOKABLE void askAIWebSearch(const QString& prompt);
     // Полностью сбрасывает память диалога на бэкенде
     Q_INVOKABLE void clearContext();
 
@@ -46,7 +51,11 @@ private:
     // (уже "финальный") запрос к тому же провайдеру ИИ с результатами поиска как контекстом,
     // чтобы получить содержательный ответ, а не просто ссылку на поисковик.
     QString buildSearchEngineUrl(const QString& query) const; // Общая логика с NAVIGATE: URL страницы выдачи выбранного в настройках поисковика — используется и как fallback, если ключ Tavily не задан или Tavily недоступен
-    void performHomeSearch(const QString& query);              // Точка входа при 'SEARCH:' от модели — сам запрос к Tavily
+    void performHomeSearch(const QString& query);              // Точка входа при 'SEARCH:' от модели и при режиме «🌐 Поиск» — сам запрос к Tavily
+    // Отправка конкретной попытки запроса к Tavily. Попыток до 3 на запрос с
+    // короткой паузой между ними; после 3-й неудачи (т.е. на 4-й раз) запрос
+    // перенаправляется на поисковик по умолчанию — как просил пользователь.
+    void sendTavilyRequest(const QString& query, const QString& tavilyKey, int attempt);
     void sendGroundedFollowup(const QString& query, const QString& searchSummary); // Второй запрос к ИИ-провайдеру с результатами поиска — та же ветвление по aiMode, что и в askAI()
 
     QNetworkAccessManager* m_netManager;

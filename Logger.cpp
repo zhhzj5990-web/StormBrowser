@@ -10,6 +10,7 @@
 #include <QtGlobal>
 #include <QHash>
 #include <QElapsedTimer>
+#include <QList>
 
 // Глобальная переменная пути к логу и мьютекс для потокобезопасности
 static QString g_logFilePath;
@@ -37,12 +38,43 @@ namespace {
             msg.contains(QString::fromUtf8(u8"🕹️"));   // Arcade Widget
     }
 
+    // P2-4: сообщения подсистем браузера помечены тегом "[Имя подсистемы]".
+    // Раньше в лог попадали ТОЛЬКО строки с эмодзи — и, например, все
+    // предупреждения "[Storm Updater]" (включая настоящие причины, по
+    // которым фоновое обновление не состоялось: 404, несовпавший хеш,
+    // ошибки диска) молча выбрасывались, из-за чего "не обновляется в
+    // фоне" было невозможно продиагностировать по логу. Теги
+    // разработческой отладки ([DIAG]) в лог по-прежнему НЕ пишутся —
+    // они слишком многословны.
+    bool isSubsystemDiagnostic(const QString& msg) {
+        static const QList<QString> tags = {
+            QStringLiteral("[Storm Updater]"),
+            QStringLiteral("[Storm Tabs]"),
+            QStringLiteral("[Storm Shield"),
+            QStringLiteral("[MainWindow]"),
+            QStringLiteral("[SingleInstance]"),
+            QStringLiteral("[PasswordManager]"),
+            QStringLiteral("[CertificateManager]"),
+            QStringLiteral("[SafeMode]"),
+            QStringLiteral("[Torrent")
+        };
+        for (const QString& tag : tags) {
+            if (msg.contains(tag, Qt::CaseInsensitive)) return true;
+        }
+        return false;
+    }
+
     // Защита от спама: если один и тот же текст сообщения прилетает повторно
     // (например, баг в цикле долбит одной и той же ошибкой), не пишем его
     // в лог чаще, чем раз в 5 секунд. Первое вхождение всегда попадает в лог.
+    // S-2: обработчик сообщений Qt вызывается из ЛЮБЫХ потоков (сетевые,
+    // WebEngine, торрент) — статический QHash без мьютекса был гонкой с
+    // риском повреждения кучи при многопоточном логировании.
     bool shouldThrottle(const QString& msg) {
+        static QMutex s_throttleMutex;
         static QHash<QString, qint64> lastSeen;
         static QElapsedTimer timer;
+        QMutexLocker lock(&s_throttleMutex);
         if (!timer.isValid()) {
             timer.start();
         }
@@ -55,6 +87,11 @@ namespace {
             return true; // подавляем повтор
         }
         lastSeen[msg] = now;
+        // Не даём таблице расти бесконечно на длинных сессиях с большим
+        // количеством уникальных сообщений (утечка памяти в самом логгере).
+        if (lastSeen.size() > 512) {
+            lastSeen.clear();
+        }
         return false;
     }
 
@@ -99,19 +136,21 @@ namespace {
 //   2. Любое сообщение (Warning ИЛИ Critical), помеченное эмодзи нашей
 //      функции (📹 Talk Widget, 🔑 Password Capture, 🕹️ Arcade Widget) -
 //      это и есть "реальные критические ошибки от функций браузера".
+//   3. Сообщения подсистем с тегом [Storm Updater]/[MainWindow]/... -
+//      жизненно важная диагностика обновлений, вкладок и безопасности
+//      (P2-4: раньше они выбрасывались, и сбои обновления были невидимы).
 // Всё остальное - Debug/Info любого происхождения, немаркированный
 // Warning/Critical от Chromium/Qt, JS-консоль сайтов, сетевые обрывы,
 // шумовые сообщения движка и т.п. - отбрасывается целиком и безусловно.
-// Списки "известного шума" и отдельная логика для сетевых ошибок больше
-// не нужны: раз сообщение не крах и не помечено как своё - оно не пишется.
 void customMessageHandler(QtMsgType type, const QMessageLogContext& context, const QString& msg) {
     Q_UNUSED(context);
 
     const bool isFatal = (type == QtFatalMsg);
     const bool isOwn = isOwnFeatureDiagnostic(msg);
+    const bool isSubsystem = isSubsystemDiagnostic(msg);
 
     if (!isFatal) {
-        if (!isOwn) return;
+        if (!isOwn && !isSubsystem) return;
         if (shouldThrottle(msg)) return;
     }
 

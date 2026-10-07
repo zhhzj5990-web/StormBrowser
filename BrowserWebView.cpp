@@ -1,5 +1,6 @@
 #include "BrowserWebView.h"
 #include "MainWindow.h"
+#include "NotesWidget.h"
 #include "PasswordManager.h"
 #include "DownloadManager.h"
 #include <QMenu>
@@ -16,8 +17,10 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QTextStream>
 #include <QProcess>
+#include <utility> // std::swap — мягкое перечитывание словарей
 #include <QSettings>
 #include <QMessageBox>
 #include <QPushButton>
@@ -30,9 +33,6 @@ BrowserWebView::BrowserWebView(MainWindow* mw, QWidget* parent)
 }
 
 void BrowserWebView::contextMenuEvent(QContextMenuEvent* event) {
-    qCritical().noquote() << "[DIAG] real page profile:" << page()->profile()->objectName()
-        << "enabled:" << page()->profile()->isSpellCheckEnabled()
-        << "langs:" << page()->profile()->spellCheckLanguages();
     event->accept(); // Явно указываем, что мы сами обрабатываем клик
     QMenu menu(mainWindow); // Меняем this на mainWindow, чтобы вынести меню из-под контроля Chromium
     menu.setStyleSheet(mainWindow->styleSheet());
@@ -147,6 +147,28 @@ void BrowserWebView::contextMenuEvent(QContextMenuEvent* event) {
     connect(aiMenu->addAction(u8"✉️ Написать пост/ответ"), &QAction::triggered, this, [triggerAi]() { triggerAi("write_post"); });
     connect(aiMenu->addAction(u8"✨ Улучшить текст (Грамматика)"), &QAction::triggered, this, [triggerAi]() { triggerAi("fix_grammar"); });
     connect(aiMenu->addAction(u8"💻 Объяснить код / Найти баги"), &QAction::triggered, this, [triggerAi]() { triggerAi("explain_code"); });
+
+    // ==========================================
+    // 📝 3.5 WEB-CLIPPER (v1.2.9): вырезка — в Заметки
+    // ==========================================
+    if (hasSelection) {
+        QAction* clipAction = menu.addAction(u8"📝 Сохранить в Заметки");
+        connect(clipAction, &QAction::triggered, this, [this, selectedText]() {
+            // selectedText из контекстного запроса иногда пуст (выделение
+            // сделали после открытия меню или Chromium ленится) — достаём
+            // сами, как это делает triggerAi выше.
+            if (selectedText.isEmpty()) {
+                page()->runJavaScript(
+                    "window.getSelection().toString()",
+                    [this](const QVariant& result) {
+                        saveClippingToNotes(result.toString());
+                    });
+            }
+            else {
+                saveClippingToNotes(selectedText);
+            }
+            });
+    }
 
     menu.addSeparator();
 
@@ -421,6 +443,27 @@ void BrowserWebView::handlePermissionRequest(QWebEnginePage* page, MainWindow* m
     s.setValue(key, allow);
 }
 
+// =========================================================================
+// v1.2.9: WEB-CLIPPER — вырезка выделенного текста в Заметки (боковая
+// панель 📝). Текст дополняется датой и источником (URL страницы),
+// панель заметок раскрывается, чтобы результат был виден сразу.
+// =========================================================================
+void BrowserWebView::saveClippingToNotes(const QString& text) {
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty()) return;
+    if (!mainWindow) return;
+
+    if (NotesWidget* notes = mainWindow->findChild<NotesWidget*>()) {
+        notes->appendClipping(trimmed, url());
+        mainWindow->openNotesPanel();
+        mainWindow->statusBar()->showMessage(
+            u8"✅ Сохранено в Заметки — боковая панель 📝", 5000);
+    }
+    else {
+        mainWindow->statusBar()->showMessage(u8"⚠ Панель заметок недоступна", 5000);
+    }
+}
+
 // ==========================================
 // Пользовательский словарь спеллчекера
 // ==========================================
@@ -588,11 +631,37 @@ void BrowserWebView::addWordToUserDictionary(const QString& word) {
     QDir().mkpath(bdicOutDir);
     const QString bdicOutPath = bdicOutDir + "/" + baseName + ".bdic";
 
+    // БЭКАП рабочего .bdic перед пересборкой. qwebengine_convert_dict
+    // бывает завершается с кодом 0, но собирает повреждённый/обрезанный
+    // файл (типичный случай — исходный .dic не в UTF-8). Такой bdic
+    // подхватывался движком и ВАЛИЛ спеллчекер целиком: подчёркивания
+    // пропадали у всех слов и не возвращались. Теперь при подозрительной
+    // сборке старый файл возвращается на место — рабочее состояние не
+    // ломаем ни при каком исходе.
+    const QString backupPath = bdicOutPath + ".bak";
+    const bool hadOldBdic = QFile::exists(bdicOutPath);
+    const qint64 oldSize = hadOldBdic ? QFileInfo(bdicOutPath).size() : 0;
+    if (hadOldBdic) {
+        QFile::remove(backupPath);
+        QFile::copy(bdicOutPath, backupPath);
+    }
+    const auto restoreBackup = [bdicOutPath, backupPath, hadOldBdic]() {
+        QFile::remove(bdicOutPath);
+        if (hadOldBdic) {
+            QFile::copy(backupPath, bdicOutPath);
+        }
+    };
+
     QProcess convert;
     convert.setProgram(convertDictToolPath());
     convert.setArguments({ affPath, bdicOutPath });
     convert.start();
     if (!convert.waitForStarted(3000) || !convert.waitForFinished(15000) || convert.exitCode() != 0) {
+        // Конвертер мог успеть создать/испортить файл до падения —
+        // восстанавливаем прежний вариант.
+        if (QFile::exists(bdicOutPath) && (!hadOldBdic || QFileInfo(bdicOutPath).size() != oldSize)) {
+            restoreBackup();
+        }
         mainWindow->statusBar()->showMessage(
             QString(u8"⚠ Слово сохранено, но не удалось пересобрать словарь сейчас (%1). "
                 u8"Подключится при следующем запуске приложения.")
@@ -600,10 +669,47 @@ void BrowserWebView::addWordToUserDictionary(const QString& word) {
         return;
     }
 
-    // Пробуем заставить движок перечитать словари без перезапуска.
-    // Не гарантировано публичным API — воспринимайте как best-effort.
-    profile->setSpellCheckLanguages({});
-    profile->setSpellCheckLanguages(langs);
+    // ВАЛИДАЦИЯ результата. Словарь с ДОБАВЛЕННЫМИ словами не может стать
+    // заметно меньше прежнего и не бывает крошечным: реальные en/ru bdic —
+    // сотни килобайт и мегабайты. Всё, что меньше, — повреждённая сборка.
+    const qint64 newSize = QFileInfo(bdicOutPath).size();
+    const bool suspicious = (newSize < 4096)
+        || (oldSize > 0 && newSize < oldSize / 2);
+    if (suspicious) {
+        restoreBackup();
+        mainWindow->statusBar()->showMessage(
+            QString(u8"⚠ «%1» сохранено в словарь, но пересборка дала повреждённый файл — "
+                u8"откатили к рабочей версии. Слово заработает после перезапуска браузера; "
+                u8"проверьте, что %2.dic в кодировке UTF-8.")
+            .arg(trimmed, baseName), 10000);
+        return;
+    }
+    QFile::remove(backupPath); // сборка прошла — бэкап больше не нужен
 
-    mainWindow->statusBar()->showMessage(QString(u8"✅ «%1» добавлено в словарь").arg(trimmed), 5000);
+    // «Мягкое» перечитывание словарей без перезапуска. Раньше здесь стоял
+    // полный сброс setSpellCheckLanguages({}) с возвратом списка — но
+    // пустой список ВЫКЛЮЧАЕТ проверку орфографии, и на уже открытых
+    // страницах она не всегда поднималась обратно (подчёркивания
+    // пропадали у всех слов до перезагрузки страницы). Теперь список
+    // НИКОГДА не становится пустым: движок дёргается перестановкой языков
+    // или временным добавлением ещё одного — этого достаточно, чтобы он
+    // перечитал .bdic с диска, а спеллчекер ни на миг не выключается.
+    {
+        QStringList nudge = langs;
+        if (nudge.size() > 1) {
+            std::swap(nudge[0], nudge[nudge.size() - 1]);
+        }
+        else if (nudge.constFirst().compare(u8"en-US", Qt::CaseInsensitive) != 0) {
+            nudge.prepend(u8"en-US");
+        }
+        else {
+            nudge.prepend(u8"en-GB");
+        }
+        profile->setSpellCheckLanguages(nudge);
+        profile->setSpellCheckLanguages(langs);
+    }
+
+    mainWindow->statusBar()->showMessage(
+        QString(u8"✅ «%1» добавлено в словарь. Если подчёркивание не пропало сразу — "
+            u8"обновите страницу (F5).").arg(trimmed), 6000);
 }

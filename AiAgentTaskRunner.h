@@ -62,7 +62,7 @@ private:
 
     void sendStep();
     void onNetworkReply(QNetworkReply* reply);
-    void scheduleNextStep(int fallbackDelayMs);
+    void scheduleNextStep(bool isNavigation);
     bool ensureGigaChatToken(const QString& gigaKey, QString& errorOut);
     void finishWith(bool success, const QString& message);
 
@@ -94,10 +94,14 @@ private:
     // сетевого сбоя (таймаут/5xx/429) — сбрасывается при любом успешном
     // ответе сервера, см. onNetworkReply().
     int m_networkRetryCount = 0;
+    // Сколько раз модель нарушала JSON-протокол (обрамляла ответ текстом) —
+    // даём одну повторную попытку исправить формат, см. onNetworkReply().
+    int m_jsonRetries = 0;
 
     QString m_cachedGigaToken;
     qint64 m_gigaTokenExpireTime = 0;
 
     static constexpr int MAX_STEPS = 15;
     static constexpr int kMaxNetworkRetries = 2;
+    static constexpr int kMaxJsonRetries = 1;
 };

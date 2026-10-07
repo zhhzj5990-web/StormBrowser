@@ -11,6 +11,7 @@
 #include <QSslSocket>
 #include <QDateTime>
 #include <QEventLoop>
+#include <QTimer>
 #include <QUrl>
 
 // Как и во всём остальном коде проекта (см. AIAssistantWidget.cpp) — u8"..."
@@ -49,6 +50,15 @@ QNetworkAccessManager* AiClient::net() {
     return m_net;
 }
 
+void AiClient::cancel() {
+    if (m_activeReply) {
+        // abort() приводит к немедленному finished с OperationCanceledError —
+        // обычная ветка обработки ошибок корректно завершит запрос (вышестоящий
+        // код по флагу отмены превратит его в «Исследование отменено»).
+        m_activeReply->abort();
+    }
+}
+
 void AiClient::sendRequest(const QString& requestId, const QJsonArray& messages,
     bool wantJsonObjectFormat, const QVariant& payload, const QString& meterKind) {
 
@@ -67,6 +77,9 @@ void AiClient::sendRequest(const QString& requestId, const QJsonArray& messages,
 
     QNetworkRequest request;
     request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+    // P2-3: без таймаута зависший ответ LLM-сервера навсегда оставлял
+    // запрос "в полёте". 2 минуты с запасом на длинные генерации.
+    request.setTransferTimeout(120 * 1000);
     QNetworkReply* reply = nullptr;
 
     if (useCustomApi) {
@@ -113,13 +126,40 @@ void AiClient::sendRequest(const QString& requestId, const QJsonArray& messages,
         reply = net()->post(request, QJsonDocument(json).toJson());
     }
 
-    if (!reply) return;
+    if (!reply) {
+        // net()->post() вернул nullptr (например, запрос отклонён ещё до
+        // отправки) — раньше это навсегда оставляло m_busy у вызывающего кода:
+        // ни один сигнал не эмитился, UI «Синтез ИИ…» вис до перезапуска.
+        emit replyFailed(requestId, QStringLiteral("Не удалось отправить запрос (пустой ответ сети)"), /*authError=*/false, payload);
+        return;
+    }
+    m_activeReply = reply;
 
-    connect(reply, &QNetworkReply::finished, this, [this, reply, requestId, payload]() {
+    // messages/flags захватываются в лямбду по значению: они нужны для
+    // единственного повтора запроса при протухшем токене GigaChat (401).
+    connect(reply, &QNetworkReply::finished, this,
+        [this, reply, requestId, payload, messages, wantJsonObjectFormat, meterKind]() {
         reply->deleteLater();
+        if (m_activeReply == reply) m_activeReply = nullptr;
 
         if (reply->error() != QNetworkReply::NoError) {
             int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+            // GigaChat: 401 — кэшированный токен протух между получением и
+            // этим запросом (живёт 1740 с). Без этой ветки один просроченный
+            // токен убивал всю собранную работу Deep Research на финальном
+            // синтезе. Сбрасываем токен и повторяем запрос ровно один раз
+            // (метка-предохранитель в payload не даёт зациклиться).
+            if (statusCode == 401 && !m_cachedGigaToken.isEmpty()
+                && QSettings().value("ai/mode", 0).toInt() == 2
+                && payload != QVariant(QStringLiteral("__giga401retried__"))) {
+                m_cachedGigaToken.clear();
+                m_gigaTokenExpireTime = 0;
+                sendRequest(requestId, messages, wantJsonObjectFormat,
+                    QVariant(QStringLiteral("__giga401retried__")), meterKind);
+                return;
+            }
+
             QJsonObject errObj = QJsonDocument::fromJson(reply->readAll()).object();
             // "detail" — то же поле, которым StormCloudBridge везде сообщает
             // ошибки сервера (login/register/purchase/...), поэтому сервер
@@ -183,6 +223,11 @@ bool AiClient::ensureGigaChatToken(const QString& gigaKey, QString& errorOut) {
     authReq.setRawHeader("RqUID", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8());
     authReq.setRawHeader("Authorization", ("Basic " + gigaKey).toUtf8());
     applyGigaChatTrustedSsl(authReq);
+    // P1-5: у запроса токена и у цикла ожидания ниже НЕ БЫЛО таймаута —
+    // зависший endpoint Сбербанка навсегда вешал UI во вложенном цикле
+    // (браузер выглядел "зависшим намертво"). Теперь и запрос, и ожидание
+    // ограничены по времени.
+    authReq.setTransferTimeout(15 * 1000);
 
     // Временный локальный менеджер на стеке — как и в оригинальном
     // AIAssistantWidget::ensureGigaChatToken. Это синхронный вызов через
@@ -194,18 +239,30 @@ bool AiClient::ensureGigaChatToken(const QString& gigaKey, QString& errorOut) {
     QNetworkAccessManager authManager;
     QNetworkReply* authReply = authManager.post(authReq, QByteArray("scope=GIGACHAT_API_PERS"));
     QEventLoop loop;
-    QObject::connect(authReply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    bool authFinished = false;
+    QObject::connect(authReply, &QNetworkReply::finished, &loop, [&loop, &authFinished]() {
+        authFinished = true;
+        loop.quit();
+        });
+    // Страховочный таймаут на случай, если ответ так и не придёт
+    // (setTransferTimeout тоже оборвёт запрос, но событие finished после
+    // abort() гарантированно завершит цикл и здесь).
+    QTimer::singleShot(20 * 1000, &loop, &QEventLoop::quit);
     loop.exec();
 
-    bool ok = (authReply->error() == QNetworkReply::NoError);
-    if (ok) {
+    bool ok = authFinished && (authReply->error() == QNetworkReply::NoError);
+    if (!ok) {
+        errorOut = authFinished ? authReply->errorString()
+            : QString::fromUtf8(u8"Таймаут запроса токена GigaChat (сервер не ответил за 20 с)");
+    }
+    else {
         QJsonObject authDoc = QJsonDocument::fromJson(authReply->readAll()).object();
         m_cachedGigaToken = authDoc.value("access_token").toString();
         m_gigaTokenExpireTime = currentTime + 1740;
         ok = !m_cachedGigaToken.isEmpty();
-    }
-    else {
-        errorOut = authReply->errorString();
+        if (!ok) {
+            errorOut = QString::fromUtf8(u8"Сервер GigaChat вернул пустой токен доступа");
+        }
     }
     authReply->deleteLater();
     return ok;

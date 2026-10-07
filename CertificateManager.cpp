@@ -10,6 +10,8 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QDebug>
+#include <QMutex>
+#include <QMutexLocker>
 
 // Пытаемся прочитать файл сертификата и как PEM, и как DER — оба формата
 // встречаются "в дикой природе" под расширением .cer (Микрософт обычно
@@ -24,8 +26,14 @@ static QList<QSslCertificate> loadCertsFromPath(const QString& path) {
 }
 
 QList<QSslCertificate> CertificateManager::builtInCertificates() {
+    // C-6: функция дергается из разных потоков (SSL-колбэки, сетевые
+    // воркеры) — статические кэш/флаг без блокировки были гонкой на
+    // QList: одновременная запись и чтение — риск повреждения кучи и
+    // отложенного краша. Ленивая инициализация через мьютекс.
+    static QMutex s_mutex;
     static QList<QSslCertificate> cache;
     static bool loaded = false;
+    QMutexLocker lock(&s_mutex);
     if (!loaded) {
         loaded = true;
         // Раньше грузили ровно два жёстко заданных имени файла

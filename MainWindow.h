@@ -19,9 +19,12 @@ class PasswordManager;
 class AIAssistantWidget;
 class ResearchWidget; // Модуль боковой панели "🔬 Глубокое исследование" — см. ResearchWidget.h
 class SmmPublishController; // Доводит посты SMM Auto-Publisher до реальной публикации — см. SmmPublishController.h
+class BrowserWebView; // Вкладка-виджет: владеет указателем на окно-владельца (см. wireTab/attachTab)
+class StormWebPage;   // Страница вкладки: тоже владеет указателем на окно-владельца
 class QLineEdit;
 class QToolButton;
 class QLabel;
+class QMenu;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -116,6 +119,11 @@ public slots:
     void openBookmarksTab();
 
     void addNewTab(const QUrl& url, bool isIncognito = false);
+    // Восстановление встроенной страницы (storm-talk, storm://home, ...) после
+    // F5/краха рендер-процесса: у этих вкладок нет реального сетевого адреса,
+    // обычный reload() ходит по фиктивному baseUrl и получает ошибку соединения.
+    // Возвращает true, если вкладка была внутренней и содержимое перезалито.
+    bool reloadInternalTab(QWebEngineView* view);
     void addCurrentBookmark();
     void clearBookmarks();
     void removeCurrentBookmark();
@@ -129,6 +137,14 @@ public slots:
     // сброса при перетаскивании вкладки между двумя уже открытыми окнами.
     void attachTab(QWidget* tabView, const QString& title, const QIcon& icon = QIcon(), int insertIndex = -1);
     void setTabCategory(int index, const QString& category, const QColor& color);
+    // v1.2.9 — закрепление вкладок (pin): компактные вкладки-иконки в начале
+    // полосы. setTabPinned — ядро (по виджету, работает и после переноса
+    // вкладки в другое окно); toggleTabPin — обёртка для контекстного меню.
+    void toggleTabPin(int index);
+    void setTabPinned(QWidget* view, bool pinned);
+    // Полный заголовок вкладки «для передачи»: у закреплённой вкладки текст
+    // в полосе пуст (компактная иконка), полный хранится в pinnedTitle.
+    QString tabTitleForTransport(int index) const;
     void groupTabsByCategory();
     void showTabContextMenu(const QPoint& pos);
     void showPasswordManager();
@@ -155,6 +171,17 @@ public slots:
     // то есть последний закрытый).
     void reopenClosedTab(const QUrl& url);
     void reopenLastClosedTab();
+
+    // v1.2.9 — раскрыть боковую панель на вкладке Заметок (используется
+    // web-clipper'ом после «📝 Сохранить в Заметки», чтобы пользователь
+    // сразу видел результат).
+    void openNotesPanel();
+
+    // v1.2.9 — горячие клавиши сессий: Ctrl+Alt+S сохраняет текущую сессию
+    // (имя «Сессия от ДД.ММ ЧЧ:ММ», как на storm://bookmarks), Ctrl+Alt+R
+    // восстанавливает последнюю сохранённую. Результат — в статус-баре.
+    void quickSaveSession();
+    void quickRestoreLastSession();
 
     void toggleShieldException();
     void setNewTabBackground();
@@ -183,6 +210,34 @@ private slots:
 
 private:
     void setupUi(bool isDetached = false);
+
+    // C-1/C-7: ВСЕ окна браузера (главное и откреплённые) используют ОДИН
+    // основной профиль WebEngine на весь процесс. Раньше каждое окно
+    // создавало свой QWebEngineProfile "StormMainProfile" на одних и тех же
+    // каталогах Cache/Storage — несколько живых профилей на одном хранилище
+    // Chromium не поддерживает: конфликты файловых блокировок, порча кэша,
+    // падения; а профиль, умерший вместе со своим окном, оставался нужен
+    // вкладкам, перенесённым в другие окна (use-after-free).
+    // Профили создаются один раз и сознательно живут до конца процесса
+    // (уничтожение общего профиля до выхода — само по себе источник гонок).
+    static QWebEngineProfile* s_sharedMainProfile;
+
+    // C-1: инкогнито- и игровые вкладки раньше создавали СВОЙ профиль на
+    // каждую вкладку — при долгих сессиях с десятками вкладок это
+    // исчерпывало память (OOM). Теперь каждый из этих профилей тоже один
+    // на процесс и переиспользуется всеми вкладками своего типа.
+    static QWebEngineProfile* s_incognitoProfile;
+    static QWebEngineProfile* s_arcadeProfile;
+    static QWebEngineProfile* sharedAuxProfile(bool gameMode);
+
+    // C-2/P1-2: полный набор сигнальных подключений ОДНОЙ вкладки к ЭТОМУ
+    // окну (страница + вид + спиннер + индикатор загрузки). Вызывается из
+    // addNewTab() при создании вкладки и из attachTab() при переносе её в
+    // другое окно — чтобы вкладка никогда не оставалась с обработчиками,
+    // указывающими на уже закрытое окно (use-after-free при отрыве вкладок
+    // был одной из причин самопроизвольного закрытия браузера).
+    void wireTab(BrowserWebView* view, StormWebPage* page);
+
     // Создаёт постоянную иконку Storm Browser в системном трее — один раз,
     // только для главного (не детач) окна, и только если ОС вообще
     // поддерживает трей (QSystemTrayIcon::isSystemTrayAvailable()). Не
@@ -193,6 +248,20 @@ private:
     void setupTrayIcon();
 
     void performFindBarSearch(bool backward, bool resetHighlight);
+
+    // --- Вкладки: кнопка «Все открытые вкладки» и перенос между окнами ---
+    // Пересобирает выпадающий список открытых вкладок (вызывается перед
+    // каждым показом меню) и обновляет счётчик на самой кнопке. Кнопка
+    // появилась взамен штатных кнопок прокрутки QTabBar, которые при
+    // нехватке места выглядели как пара серых квадратиков, сливавшихся
+    // с фоном, и не давали увидеть полный список вкладок.
+    void rebuildTabsMenu(QMenu* menu);
+    void updateTabsListButton();
+    // Поиск окна-цели для возврата вкладки (основное, иначе любое другое)
+    // и сам перенос — пункты контекстного меню вкладки. См.
+    // MainWindow_Tabs.cpp.
+    MainWindow* findHomeWindowForReattach() const;
+    void moveTabToWindow(int index, MainWindow* target);
 
     // Куки не за которых нет в списке исключений удаляются на СЛЕДУЮЩЕМ
     // старте (см. подробное объяснение у SettingsBridge::toggleClearSiteDataOnClose
@@ -223,6 +292,14 @@ private:
     QPointer<QMainWindow> m_devToolsWindow;
     QPointer<QWebEngineView> m_devToolsView;
 
+
+    // Фильтр перетаскивания вкладок (TabDragDropFilter из MainWindow.cpp).
+    // Держим указатель, чтобы ставить его же на каждый BrowserWebView
+    // (drop-зона «вернуть вкладку» — вся площадь окна, а не только полоса
+    // вкладок) и снимать при переносе вкладки в другое окно.
+    QObject* m_tabDragFilter = nullptr;
+    // Кнопка «☰ N ▾» в правом углу полосы вкладок — список всех вкладок.
+    QToolButton* m_tabsListBtn = nullptr;
 
     QWidget* m_findBar = nullptr;
     QLineEdit* m_findLineEdit = nullptr;

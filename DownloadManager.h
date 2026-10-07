@@ -245,6 +245,16 @@ public:
     // startDownload() использует его напрямую, без диалога выбора папки
     // (докачка после перезапуска браузера, resumeIncompleteTorrentsIfAny()).
     explicit TorrentItem(const QString& magnetLink, QWidget* parent = nullptr, const QString& resumeSaveDir = QString());
+
+    // C-4: карточку можно удалить в любой момент — кнопкой «Очистить»
+    // (clearHistory), при закрытии окна/браузера, при сносе DownloadManager.
+    // Пока поток скачивания жив, уничтожать QThread нельзя — Qt завершает
+    // весь процесс с «QThread: Destroyed while thread is still running»
+    // (браузер мгновенно закрывался сам). Деструктор мягко останавливает
+    // поток и дожидается его завершения — ровно то, что делает кнопка
+    // «Отмена», только без записи в историю и без deleteLater.
+    ~TorrentItem() override;
+
     void startDownload();
 
     // Те же геттеры, что и у DownloadItem — для живого прогресса на

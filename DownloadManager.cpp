@@ -1310,6 +1310,20 @@ void TorrentItem::updateUi(int percent, const QString& status, const QString& sp
     m_metaLabel->setText(status + u8" · " + speed + u8" · " + peers);
 }
 
+TorrentItem::~TorrentItem() {
+    // C-4: см. объявление в DownloadManager.h. Без этого деструктора
+    // «Очистить список» с активными торрентами, закрытие окна браузера с
+    // качающимся торрентом и перезапуск на обновление УБИВАЛИ QThread с
+    // живым потоком внутри — Qt аварийно завершал весь процесс
+    // («QThread: Destroyed while thread is still running»), что выглядело
+    // как очередное «браузер сам закрылся».
+    m_isActive = false;
+    if (m_thread && m_thread->isRunning()) {
+        m_thread->stop();
+        m_thread->wait(10000); // цикл libtorrent проверяет флаг раз в ~1с — этого с запасом
+    }
+}
+
 void TorrentItem::cancelDownload() {
     m_isActive = false;
     if (m_thread && m_thread->isRunning()) {

@@ -64,11 +64,13 @@ static QString agentSystemPrompt() {
 Каждый интерактивный элемент приходит с числовым полем "id" — используй именно это число как "target" в своём действии, не пытайся придумывать CSS-селекторы или XPath.
 
 Отвечай СТРОГО одним JSON-объектом, без какого-либо текста до или после него, в формате:
-{"message": "текст для пользователя в чате: что ты сейчас делаешь и почему, либо итоговый результат", "action": {"type": "click | type | scroll | navigate | look | search | done", "target": <id элемента для click/type/scroll>, "target_text": "точный видимый текст элемента (запасной вариант для click)", "value": "текст для ввода при type", "url": "адрес при navigate", "query": "поисковый запрос при search"}}
+{"message": "текст для пользователя в чате: что ты сейчас делаешь и почему, либо итоговый результат", "action": {"type": "click | type | scroll | navigate | press_enter | look | search | done", "target": <id элемента для click/type/scroll/press_enter, число>, "target_text": "точный видимый текст/подсказка элемента (запасной вариант для click и type)", "value": "текст для ввода при type", "url": "адрес при navigate", "direction": "up или down — для scroll без target (по умолчанию down)", "amount": <процент высоты окна для scroll, 10-300, по умолчанию 80>, "query": "поисковый запрос при search"}}
 
 Правила:
 - Одно действие за один ответ. После выполнения тебе пришлют обновлённое состояние страницы, и ты сможешь продолжить.
-- Для click в первую очередь используй "target" (id из списка elements). Если нужный элемент (например, карточка сообщества, товар, строка списка) виден в тексте страницы, но НЕ попал в список elements — всё равно верни "action":{"type":"click"}, но вместо "target" укажи "target_text" с точным видимым текстом этого элемента (или его отличительной частью) — система сама найдёт и нажмёт его на странице.
+- Для click/type в первую очередь используй "target" (id из списка elements). Если нужный элемент (например, карточка сообщества, товар, строка списка) виден в тексте страницы, но НЕ попал в список elements — всё равно верни action, но вместо "target" укажи "target_text" с точным видимым текстом этого элемента (или его отличительной частью) — система сама найдёт и нажмёт его на странице (для type это может быть placeholder/подпись поля).
+- Текст страницы в состоянии может быть ОБРЕЗАН (длинные страницы) — если нужное не видно, прокрути страницу (scroll, direction: down) и продолжай. Список elements содержит только элементы, видимые в текущей прокрутке.
+- "press_enter" — нажать Enter в поле (отправка формы, подтверждение выбора). Удобно, когда кнопка отправки не находится.
 - "search" — ищет свежую информацию в реальном интернете (через Tavily), а не на текущей странице. Используй, когда для ответа или для шага задачи не хватает данных с самой страницы: нужна новость, курс, цена, факт, дата или любые актуальные сведения извне. Укажи короткий чёткий запрос в поле "query". Результаты поиска придут тебе вместе с состоянием на следующем шаге — сам по себе "search" ничего на странице не меняет. Если поиск окажется недоступен (например, не задан ключ Tavily в настройках), тебе придёт об этом сообщение — в этом случае отвечай по своим знаниям и предупреди об этом пользователя в "message".
 - "look" — самый крайний и самый дорогой вариант: он делает снимок экрана страницы и присылает тебе его как картинку, чтобы ты сориентировался визуально. Используй его, только если несколько попыток через click/target_text/scroll не помогли разобраться в странице по тексту — не в начале задачи и не при каждом шаге. Если "look" по какой-то причине недоступен (например, для текущего бэкенда не настроена vision-модель), тебе придёт об этом сообщение — в этом случае просто продолжай обычными способами.
 - Никогда не угадывай адрес для "navigate" внутри того же сайта (не выдумывай /ссылки/, /id, /слаги и т.п.). "navigate" используй только если точный адрес есть в предоставленных данных (например, в поле href элемента) или это переход на заведомо известный внешний сайт по прямой просьбе пользователя. Для перехода внутри сайта (открыть карточку, раздел, профиль) всегда предпочитай click/target_text, а не navigate.
@@ -242,6 +244,14 @@ void AIAssistantWidget::attachFile() {
     if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         attachedFileText = QString::fromUtf8(file.readAll());
         attachedFilename = QFileInfo(filepath).fileName();
+        // Лимит размера вложения: раньше файл читался целиком и улетал в КАЖДЫЙ
+        // последующий запрос до конца диалога — большой файл ломал все запросы
+        // (413/400 у провайдера) на десятки сообщений вперёд.
+        constexpr qsizetype kMaxAttachChars = 150 * 1000;
+        if (attachedFileText.size() > kMaxAttachChars) {
+            attachedFileText = attachedFileText.left(kMaxAttachChars);
+            attachedFileText += u8"\n…[файл обрезан до первых 150 КБ]";
+        }
         attachLabel->setText(u8"📎 Прикреплен: " + attachedFilename);
         attachWidget->show();
         file.close();
@@ -288,21 +298,32 @@ bool AIAssistantWidget::ensureGigaChatToken(const QString& gigaKey, QString& err
     authReq.setRawHeader("RqUID", QUuid::createUuid().toString(QUuid::WithoutBraces).toUtf8());
     authReq.setRawHeader("Authorization", ("Basic " + gigaKey).toUtf8());
     applyGigaChatTrustedSsl(authReq);
+    // Таймаут запроса и страховочный таймер на цикле ожидания — без них зависший
+    // endpoint Сбербанка навсегда оставлял UI во вложенном loop.exec() (тот же фикс
+    // P1-5, что уже применён в AiClient.cpp, — здесь его вторая копия).
+    authReq.setTransferTimeout(15 * 1000);
 
     QNetworkAccessManager authManager;
     QNetworkReply* authReply = authManager.post(authReq, "scope=GIGACHAT_API_PERS");
     QEventLoop loop;
-    QObject::connect(authReply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    bool authFinished = false;
+    QObject::connect(authReply, &QNetworkReply::finished, &loop, [&loop, &authFinished]() {
+        authFinished = true;
+        loop.quit();
+        });
+    QTimer::singleShot(20 * 1000, &loop, &QEventLoop::quit);
     loop.exec();
 
-    bool ok = (authReply->error() == QNetworkReply::NoError);
+    bool ok = authFinished && (authReply->error() == QNetworkReply::NoError);
     if (ok) {
         QJsonDocument authDoc = QJsonDocument::fromJson(authReply->readAll());
         cachedGigaToken = authDoc.object().value("access_token").toString();
         gigaTokenExpireTime = currentTime + 1740;
+        ok = !cachedGigaToken.isEmpty();
+        if (!ok) errorOut = u8"сервер вернул пустой токен";
     }
     else {
-        errorOut = authReply->errorString();
+        errorOut = authFinished ? authReply->errorString() : u8"таймаут запроса токена (сервер не ответил за 20 с)";
     }
     authReply->deleteLater();
     return ok;
@@ -325,16 +346,22 @@ bool AIAssistantWidget::uploadImageToGigaChat(const QByteArray& pngBytes, QStrin
     QNetworkRequest request(QUrl("https://api.giga.chat/v1/files"));
     request.setRawHeader("Authorization", ("Bearer " + cachedGigaToken).toUtf8());
     applyGigaChatTrustedSsl(request);
+    request.setTransferTimeout(30 * 1000); // + страховка цикла ожидания ниже — без них зависшая загрузка вешала панель
 
     QNetworkAccessManager uploadManager;
     QNetworkReply* reply = uploadManager.post(request, multiPart);
     multiPart->setParent(reply); // удалится вместе с ответом
 
     QEventLoop loop;
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    bool uploadFinished = false;
+    QObject::connect(reply, &QNetworkReply::finished, &loop, [&loop, &uploadFinished]() {
+        uploadFinished = true;
+        loop.quit();
+        });
+    QTimer::singleShot(35 * 1000, &loop, &QEventLoop::quit);
     loop.exec();
 
-    bool ok = (reply->error() == QNetworkReply::NoError);
+    bool ok = uploadFinished && (reply->error() == QNetworkReply::NoError);
     if (ok) {
         QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
         fileIdOut = obj.value("id").toString();
@@ -342,7 +369,7 @@ bool AIAssistantWidget::uploadImageToGigaChat(const QByteArray& pngBytes, QStrin
         if (!ok) errorOut = u8"сервер не вернул id загруженного файла";
     }
     else {
-        errorOut = reply->errorString();
+        errorOut = uploadFinished ? reply->errorString() : u8"таймаут загрузки файла (сервер не ответил за 35 с)";
     }
     reply->deleteLater();
     return ok;
@@ -411,6 +438,10 @@ void AIAssistantWidget::sendChatMessage() {
 
     m_busy = true;
     setUIEnabled(false);
+    // Кнопка «Стоп» теперь видна ВСЁ время занятости (не только в агентном режиме):
+    // раньше на фазах классификации/простого ответа прервать зависший запрос было
+    // невозможно вообще — поле ввода и «Отправить» заблокированы, стопа нет.
+    stopAgentBtn->show();
     resultBrowser->append(u8"<br><i>⏳ Storm AI думает...</i>");
 
     if (hasFile) {
@@ -510,11 +541,14 @@ void AIAssistantWidget::performTavilySearch(const QString& query, const QString&
     QNetworkRequest request(QUrl("https://api.tavily.com/search"));
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+    request.setTransferTimeout(30 * 1000);
 
     QNetworkReply* reply = m_searchManager->post(request, QJsonDocument(body).toJson());
     reply->setProperty("stormSearchQuery", trimmedQuery);
     reply->setProperty("stormSearchMode", mode);
     reply->setProperty("stormSearchPayload", payload);
+    reply->setProperty("stormGen", m_taskGeneration); // для отбрасывания ответов прошлой задачи
+    m_activeSearchReply = reply;
 }
 
 // Ключ не задан или пустой запрос — обрабатываем как обычный "неудачный" исход поиска, но
@@ -535,12 +569,16 @@ void AIAssistantWidget::onTavilySearchUnavailable(const QString& query, const QS
 
 void AIAssistantWidget::onSearchNetworkReply(QNetworkReply* reply) {
     reply->deleteLater();
+    if (m_activeSearchReply == reply) m_activeSearchReply = nullptr;
 
     QString query = reply->property("stormSearchQuery").toString();
     QString mode = reply->property("stormSearchMode").toString();
     QVariant payload = reply->property("stormSearchPayload");
 
-    if (mode == "agent" && !m_agentRunning) return; // цепочка действий уже остановлена/завершена
+    // Ответ прошлой (уже остановленной/завершённой) агентной задачи — выбрасываем.
+    if (mode == "agent" && (!m_agentRunning || reply->property("stormGen").toInt() != m_taskGeneration)) return;
+    // Standalone-поиск отменён кнопкой «Стоп» — тоже выбрасываем.
+    if (mode != "agent" && !m_busy) return;
 
     if (reply->error() != QNetworkReply::NoError) {
         int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -591,9 +629,27 @@ void AIAssistantWidget::onSearchNetworkReply(QNetworkReply* reply) {
 
 void AIAssistantWidget::startPageAgentFlow() {
     m_agentStepCount = 0;
+    m_jsonRetries = 0;
+    m_giga401Retried = false;
     m_lastActionSummary = u8"Действие ещё не выполнялось.";
     m_lastSeenUrl.clear();
     m_lastSeenPageText.clear();
+
+    // Исходная задача = последнее сообщение пользователя (классификатор направил
+    // его в агентный режим). Закрепляем её отдельной строкой — окно chatHistory
+    // не должно иметь возможности её вытеснить (см. комментарий в .h).
+    m_agentTaskPrompt.clear();
+    for (int i = chatHistory.size() - 1; i >= 0; --i) {
+        if (chatHistory[i].role == "user" && !chatHistory[i].agentStep) {
+            m_agentTaskPrompt = chatHistory[i].content;
+            break;
+        }
+    }
+
+    // Новое «поколение» задачи: все отложенные колбэки прошлой задачи (старые
+    // сетевые ответы, loadFinished, таймеры) будут отброшены сверкой поколений.
+    m_taskGeneration++;
+
     m_pageAgent->beginTask(); // Фиксирует активную вкладку под эту задачу и подчищает возможные старые эффекты на ней
 
     m_agentRunning = true;
@@ -626,6 +682,7 @@ void AIAssistantWidget::runContextMenuAction(const QString& actionType, const QS
 
     m_busy = true;
     setUIEnabled(false);
+    stopAgentBtn->show(); // см. комментарий в sendChatMessage — прервать можно любой запрос
     resultBrowser->append(u8"<br><i>⏳ Storm AI думает...</i>");
 
     sendSimpleChatRequest(fullContent);
@@ -649,6 +706,9 @@ void AIAssistantWidget::postQuickRequest(const QJsonArray& messages, bool wantJs
 
     QNetworkRequest request;
     request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+    // Таймаут на ВСЕ быстрые запросы — зависший ответ провайдера раньше держал
+    // m_busy=true бесконечно (панель заблокирована до перезапуска браузера).
+    request.setTransferTimeout(120 * 1000);
     QNetworkReply* reply = nullptr;
 
     if (useCustomApi) {
@@ -689,11 +749,18 @@ void AIAssistantWidget::postQuickRequest(const QJsonArray& messages, bool wantJs
     if (reply) {
         reply->setProperty("stormKind", requestKind);
         reply->setProperty("stormPayload", payload);
+        m_activeQuickReply = reply;
     }
 }
 
 void AIAssistantWidget::onQuickNetworkReply(QNetworkReply* reply) {
     reply->deleteLater();
+    if (m_activeQuickReply == reply) m_activeQuickReply = nullptr;
+
+    // Пользователь успел нажать «Стоп» (или запрос был отменён) — ответ
+    // относится к уже прерванному диалогу, просто выбрасываем его.
+    if (!m_busy) return;
+
     QString kind = reply->property("stormKind").toString();
 
     if (reply->error() != QNetworkReply::NoError) {
@@ -776,15 +843,30 @@ void AIAssistantWidget::sendAgentRequest() {
     if (!m_agentRunning) return;
 
     if (m_agentStepCount >= MAX_AGENT_STEPS) {
-        chatHistory.append(ChatMessage{ "assistant", u8"⚠️ Достигнут лимит шагов (" + QString::number(MAX_AGENT_STEPS) + u8") на этой странице — останавливаюсь, чтобы не зациклиться. Уточните задачу или продолжите вручную." });
+        chatHistory.append(ChatMessage{ "assistant", u8"⚠️ Достигнут лимит шагов (" + QString::number(MAX_AGENT_STEPS) + u8") на этой странице — останавливаюсь, чтобы не зациклиться. Уточните задачу или продолжите вручную.", true });
         renderChat();
         finishAgentTask();
         return;
     }
     m_agentStepCount++;
 
-    m_pageAgent->capturePageContext([this](const QJsonObject& page) {
-        if (!m_agentRunning) return;
+    // Поколение захватываем СЕЙЧАС: если задача будет остановлена, пока мы ждём
+    // снимок страницы, колбэк устареет и тихо выбросится.
+    const int gen = m_taskGeneration;
+
+    m_pageAgent->capturePageContext([this, gen](const QJsonObject& page) {
+        if (!m_agentRunning || gen != m_taskGeneration) return;
+
+        // Вкладка задачи закрылась ПОСЕРЕДИНЕ цикла (hasPage=false при уже начатой
+        // работе) — раньше агент продолжал бы на «текущей активной» вкладке (см.
+        // фикс targetView в WebPageAgent — теперь её просто нет) и бесконечно
+        // рассуждал о недоступной странице. Честно завершаем задачу.
+        if (!page.value("hasPage").toBool() && m_agentStepCount > 1) {
+            chatHistory.append(ChatMessage{ "assistant", u8"⚠️ Вкладка, с которой я работал, была закрыта — останавливаюсь. Откройте страницу заново и повторите задачу.", true });
+            renderChat();
+            finishAgentTask();
+            return;
+        }
 
         QSettings settings;
         int aiMode = settings.value("ai/mode", 0).toInt();
@@ -802,7 +884,25 @@ void AIAssistantWidget::sendAgentRequest() {
         QJsonArray messagesArray;
         messagesArray.append(sysMsg);
 
+        // ЗАКРЕПЛЁННАЯ исходная задача — всегда первым user-сообщением (см.
+        // startPageAgentFlow/m_agentTaskPrompt): окно истории в 10 сообщений
+        // больше не может вытеснить цель задачи из контекста.
+        if (!m_agentTaskPrompt.isEmpty()) {
+            QJsonObject taskMsg;
+            taskMsg["role"] = "user";
+            taskMsg["content"] = m_agentTaskPrompt;
+            messagesArray.append(taskMsg);
+        }
+
+        // Из общей истории берём ТОЛЬКО сообщения текущего цикла (agentStep) —
+        // старый диалог и так представлен закреплённой задачей, а экономия
+        // токенов на каждом шаге существенна.
+        QList<ChatMessage> stepMsgs;
         for (const auto& msg : chatHistory) {
+            if (msg.agentStep) stepMsgs.append(msg);
+        }
+        while (stepMsgs.size() > 10) stepMsgs.removeFirst();
+        for (const auto& msg : stepMsgs) {
             QJsonObject m; m["role"] = msg.role; m["content"] = msg.content;
             messagesArray.append(m);
         }
@@ -820,6 +920,15 @@ void AIAssistantWidget::sendAgentRequest() {
                     ? u8"\nПроверка: страница изменилась после последнего действия."
                     : u8"\nПроверка: страница НЕ изменилась после последнего действия — вероятно, клик пришёлся мимо, элемент не тот, или нужен другой способ.";
             }
+            // Бюджет шагов и обрезка текста — модель знает об ограничениях и
+            // действует эффективнее (не тратит шаги на пустое).
+            int stepsLeft = MAX_AGENT_STEPS - m_agentStepCount + 1;
+            if (stepsLeft <= 6) {
+                verificationNote += u8"\nОсталось шагов до принудительной остановки: " + QString::number(stepsLeft) + u8".";
+            }
+            if (page.value("textTruncated").toBool()) {
+                verificationNote += u8"\nТекст страницы обрезан (страница длинная) — нужное может быть ниже: используй scroll (direction: down).";
+            }
             m_lastSeenUrl = url;
             m_lastSeenPageText = bodyText;
 
@@ -827,13 +936,13 @@ void AIAssistantWidget::sendAgentRequest() {
             contextContent = u8"[Текущее состояние открытой страницы]\n"
                 u8"Текущий адрес (URL): " + url + u8"\n"
                 u8"Заголовок вкладки: " + title + u8"\n\n"
-                u8"Полный срез страницы (JSON — текст и интерактивные элементы):\n"
+                u8"Полный срез страницы (JSON — текст и интерактивные элементы; текст может быть обрезан):\n"
                 + QString::fromUtf8(pageDoc.toJson(QJsonDocument::Compact))
                 + u8"\n\nПоследнее выполненное действие: " + m_lastActionSummary
                 + verificationNote;
         }
         else {
-            contextContent = u8"[У пользователя сейчас нет открытой вкладки сайта — действия click/type/scroll/navigate/look выполнить не получится. Доступны только \"search\" (поиск в интернете через Tavily) и \"done\".]";
+            contextContent = u8"[У пользователя сейчас нет открытой вкладки сайта — действия click/type/scroll/navigate/look/press_enter выполнить не получится. Доступны только \"search\" (поиск в интернете через Tavily) и \"done\".]";
         }
         QJsonObject ctxMsg; ctxMsg["role"] = "user"; ctxMsg["content"] = contextContent;
         messagesArray.append(ctxMsg);
@@ -843,7 +952,11 @@ void AIAssistantWidget::sendAgentRequest() {
 
         QNetworkRequest request;
         request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+        // Зависший ответ LLM-провайдера не должен вечно держать агентный цикл —
+        // таймаут тот же, что в AiClient (P2-3).
+        request.setTransferTimeout(120 * 1000);
 
+        QNetworkReply* reply = nullptr;
         if (useCustomApi) {
             json["model"] = QString("openrouter/auto");
             json["route"] = QString("fallback");
@@ -853,12 +966,12 @@ void AIAssistantWidget::sendAgentRequest() {
             request.setRawHeader("Authorization", ("Bearer " + apiKey).toUtf8());
             request.setRawHeader("HTTP-Referer", "https://storm-browser.ru/");
             request.setRawHeader("X-Title", "Storm Browser");
-            networkManager->post(request, QJsonDocument(json).toJson());
+            reply = networkManager->post(request, QJsonDocument(json).toJson());
         }
         else if (useGigaChat) {
             QString authErr;
             if (!ensureGigaChatToken(gigaKey, authErr)) {
-                chatHistory.append(ChatMessage{ "assistant", u8"❌ Ошибка авторизации GigaChat: " + authErr });
+                chatHistory.append(ChatMessage{ "assistant", u8"❌ Ошибка авторизации GigaChat: " + authErr, true });
                 renderChat();
                 finishAgentTask();
                 return;
@@ -868,7 +981,7 @@ void AIAssistantWidget::sendAgentRequest() {
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
             request.setRawHeader("Authorization", ("Bearer " + cachedGigaToken).toUtf8());
             applyGigaChatTrustedSsl(request);
-            networkManager->post(request, QJsonDocument(json).toJson());
+            reply = networkManager->post(request, QJsonDocument(json).toJson());
         }
         else {
             json["username"] = user;
@@ -876,7 +989,11 @@ void AIAssistantWidget::sendAgentRequest() {
             json["user_api_key"] = QString("");
             request.setUrl(QUrl("https://storm-browser.online:8000/api/ai/chat")); // актуальный адрес (было http://147.45.178.149:8000)
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-            networkManager->post(request, QJsonDocument(json).toJson());
+            reply = networkManager->post(request, QJsonDocument(json).toJson());
+        }
+        if (reply) {
+            reply->setProperty("stormGen", gen);
+            m_activeAgentReply = reply;
         }
         });
 }
@@ -909,10 +1026,11 @@ void AIAssistantWidget::performVisionLook() {
         return;
     }
 
-    m_lastActionSummary = u8"[look] — посмотрел на снимок страницы.";
+    m_lastActionSummary = u8"[look] — делаю снимок страницы…";
 
-    m_pageAgent->captureScreenshotBase64([this, useCustomApi, useGigaChat, visionModel](const QString& base64Png) {
-        if (!m_agentRunning) return;
+    const int gen = m_taskGeneration;
+    m_pageAgent->captureScreenshotBase64([this, useCustomApi, useGigaChat, visionModel, gen](const QString& base64Png) {
+        if (!m_agentRunning || gen != m_taskGeneration) return;
 
         if (base64Png.isEmpty()) {
             m_lastActionSummary = u8"[look] — не удалось сделать снимок страницы.";
@@ -933,17 +1051,31 @@ void AIAssistantWidget::performVisionLook() {
         QJsonArray messagesArray;
         messagesArray.append(sysMsg);
 
+        // Та же схема закрепления задачи, что в sendAgentRequest — vision-шаг
+        // тоже не должен терять цель из-за окна истории.
+        if (!m_agentTaskPrompt.isEmpty()) {
+            QJsonObject taskMsg;
+            taskMsg["role"] = "user";
+            taskMsg["content"] = m_agentTaskPrompt;
+            messagesArray.append(taskMsg);
+        }
+        QList<ChatMessage> stepMsgs;
         for (const auto& msg : chatHistory) {
+            if (msg.agentStep) stepMsgs.append(msg);
+        }
+        while (stepMsgs.size() > 10) stepMsgs.removeFirst();
+        for (const auto& msg : stepMsgs) {
             QJsonObject m; m["role"] = msg.role; m["content"] = msg.content;
             messagesArray.append(m);
         }
-
         QString promptText = u8"[Скриншот текущей страницы]";
         if (!m_lastSeenUrl.isEmpty()) promptText += u8"\nТекущий адрес (URL): " + m_lastSeenUrl;
         promptText += u8"\nПосмотри на изображение и реши, что делать дальше. Отвечай как обычно — строго JSON (message + action).";
 
         QNetworkRequest request;
         request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+        request.setTransferTimeout(120 * 1000);
+        QNetworkReply* visionReply = nullptr;
 
         if (useCustomApi) {
             // OpenRouter/OpenAI-совместимый формат: картинка — инлайн base64 внутри content.
@@ -965,7 +1097,7 @@ void AIAssistantWidget::performVisionLook() {
             request.setRawHeader("Authorization", ("Bearer " + apiKey).toUtf8());
             request.setRawHeader("HTTP-Referer", "https://storm-browser.ru/");
             request.setRawHeader("X-Title", "Storm Browser");
-            networkManager->post(request, QJsonDocument(json).toJson());
+            visionReply = networkManager->post(request, QJsonDocument(json).toJson());
         }
         else if (useGigaChat) {
             // GigaChat не принимает картинку инлайн — сперва грузим её в хранилище и
@@ -973,7 +1105,7 @@ void AIAssistantWidget::performVisionLook() {
             QString gigaKey = settings.value("ai/gigachat_key", "").toString();
             QString authErr;
             if (!ensureGigaChatToken(gigaKey, authErr)) {
-                chatHistory.append(ChatMessage{ "assistant", u8"❌ Ошибка авторизации GigaChat: " + authErr });
+                chatHistory.append(ChatMessage{ "assistant", u8"❌ Ошибка авторизации GigaChat: " + authErr, true });
                 renderChat();
                 finishAgentTask();
                 return;
@@ -1002,31 +1134,54 @@ void AIAssistantWidget::performVisionLook() {
             request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
             request.setRawHeader("Authorization", ("Bearer " + cachedGigaToken).toUtf8());
             applyGigaChatTrustedSsl(request);
-            networkManager->post(request, QJsonDocument(json).toJson());
+            visionReply = networkManager->post(request, QJsonDocument(json).toJson());
+        }
+        if (visionReply) {
+            visionReply->setProperty("stormGen", gen);
+            m_activeAgentReply = visionReply;
+        }
+        else {
+            // Ни одна ветка не сработала (не должно происходить) — не оставляем
+            // цикл висеть без ответа.
+            scheduleNextAgentStep(200);
         }
         });
 }
 
 void AIAssistantWidget::onAgentNetworkReply(QNetworkReply* reply) {
     reply->deleteLater();
+    if (m_activeAgentReply == reply) m_activeAgentReply = nullptr;
     if (!m_agentRunning) return;
+    // Ответ прошлой задачи (Стоп → сразу новая задача → пришёл старый ответ) —
+    // раньше он парсился как ответ НОВОЙ задачи и приводил к двойным действиям.
+    if (reply->property("stormGen").toInt() != m_taskGeneration) return;
 
     if (reply->error() != QNetworkReply::NoError) {
         int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         QString errorStr = reply->errorString();
 
         QSettings errSettings;
-        bool errUsingOwnKey = (errSettings.value("ai/mode", 0).toInt() == 0);
-        bool errUsingGigaChat = (errSettings.value("ai/mode", 0).toInt() == 2);
+        int errMode = errSettings.value("ai/mode", 0).toInt();
+
+        // GigaChat: 401 посреди задачи — кэшированный токен протух. Сбрасываем
+        // и повторяем текущий шаг (ensureGigaChatToken получит новый) — один раз.
+        if (statusCode == 401 && errMode == 2 && !cachedGigaToken.isEmpty() && !m_giga401Retried) {
+            m_giga401Retried = true;
+            cachedGigaToken.clear();
+            gigaTokenExpireTime = 0;
+            m_agentStepCount--; // повтор из-за авторизации не съедает бюджет шагов
+            sendAgentRequest();
+            return;
+        }
 
         QString errorMsg;
-        if (statusCode == 502) errorMsg = errUsingOwnKey ? u8"❌ Ошибка 502: OpenRouter недоступен." : (errUsingGigaChat ? u8"❌ Ошибка 502: GigaChat недоступен." : u8"❌ Ошибка 502: Все AI-серверы перегружены.");
-        else if (statusCode == 403) errorMsg = errUsingGigaChat ? u8"❌ Ошибка 403: Доступ к GigaChat запрещен." : u8"❌ Недостаточно AI-токенов.";
-        else if (statusCode == 401) errorMsg = errUsingOwnKey ? u8"❌ Ошибка 401: Неверный API-ключ OpenRouter." : (errUsingGigaChat ? u8"❌ Ошибка 401: Неверный токен GigaChat." : u8"❌ Ошибка 401: Неверный логин или пароль ЛК.");
+        if (statusCode == 502) errorMsg = (errMode == 0) ? u8"❌ Ошибка 502: OpenRouter недоступен." : ((errMode == 2) ? u8"❌ Ошибка 502: GigaChat недоступен." : u8"❌ Ошибка 502: Все AI-серверы перегружены.");
+        else if (statusCode == 403) errorMsg = (errMode == 2) ? u8"❌ Ошибка 403: Доступ к GigaChat запрещен." : u8"❌ Недостаточно AI-токенов.";
+        else if (statusCode == 401) errorMsg = (errMode == 0) ? u8"❌ Ошибка 401: Неверный API-ключ OpenRouter." : ((errMode == 2) ? u8"❌ Ошибка 401: Неверный токен GigaChat." : u8"❌ Ошибка 401: Неверный логин или пароль ЛК.");
         else if (statusCode == 0) errorMsg = u8"❌ Нет подключения к серверу. Проверьте интернет.";
         else errorMsg = u8"❌ Ошибка " + QString::number(statusCode) + u8": " + errorStr;
 
-        chatHistory.append(ChatMessage{ "assistant", errorMsg });
+        chatHistory.append(ChatMessage{ "assistant", errorMsg, true });
         renderChat();
         finishAgentTask();
         return;
@@ -1076,15 +1231,32 @@ void AIAssistantWidget::onAgentNetworkReply(QNetworkReply* reply) {
         action = parsed.value("action").toObject();
     }
     else {
-        // Модель не выполнила формат ответа — показываем как обычный текст и завершаем цепочку,
+        // Модель не выполнила формат (обернула JSON текстом/оборвала). Даём
+        // ОДНУ попытку исправиться, а не убиваем цепочку сразу — типичная
+        // проблема GigaChat, который не поддерживает response_format:json_object.
+        if (m_jsonRetries < 1) {
+            m_jsonRetries++;
+            if (!content.isEmpty()) {
+                chatHistory.append(ChatMessage{ "assistant", content.left(600), true });
+            }
+            chatHistory.append(ChatMessage{ "user",
+                u8"[Твой прошлый ответ не удалось разобрать как JSON-объект нужного формата. "
+                u8"Повтори ответ СТРОГО одним JSON-объектом {\"message\":\"...\",\"action\":{...}} "
+                u8"без какого-либо текста до или после.]", true });
+            if (chatHistory.size() > 14) chatHistory.removeFirst();
+            renderChat();
+            sendAgentRequest();
+            return;
+        }
+        // Формат нарушен повторно — показываем как обычный текст и завершаем цепочку,
         // чтобы не выполнять действия "вслепую" по неразобранному ответу.
         message = content.isEmpty() ? u8"⚠️ Сервер вернул пустой ответ или неизвестный формат JSON." : content;
         action["type"] = "done";
     }
 
     if (!message.isEmpty()) {
-        chatHistory.append(ChatMessage{ "assistant", message });
-        if (chatHistory.size() > 10) chatHistory.removeFirst();
+        chatHistory.append(ChatMessage{ "assistant", message, true });
+        if (chatHistory.size() > 14) chatHistory.removeFirst();
         renderChat();
     }
 
@@ -1115,11 +1287,13 @@ void AIAssistantWidget::onAgentNetworkReply(QNetworkReply* reply) {
     else if (actionType == "type") stepLabel = u8"ввожу текст в поле…";
     else if (actionType == "scroll") stepLabel = u8"прокручиваю страницу…";
     else if (actionType == "navigate") stepLabel = u8"перехожу по ссылке…";
+    else if (actionType == "press_enter") stepLabel = u8"нажимаю Enter…";
     else stepLabel = u8"выполняю действие…";
     m_pageAgent->updateStatus(stepLabel);
 
-    m_pageAgent->executeAction(action, [this, actionType](bool success, QString detail) {
-        if (!m_agentRunning) return;
+    const int gen = m_taskGeneration;
+    m_pageAgent->executeAction(action, [this, actionType, gen](bool success, QString detail) {
+        if (!m_agentRunning || gen != m_taskGeneration) return;
 
         // detail теперь может содержать конкретную причину неудачи (не найден / перекрыт
         // другим элементом и т.п.) — передаём её ИИ как есть, вместо общей фразы, чтобы
@@ -1143,38 +1317,37 @@ void AIAssistantWidget::onAgentNetworkReply(QNetworkReply* reply) {
 void AIAssistantWidget::scheduleNextAgentStep(int fallbackDelayMs) {
     if (!m_agentRunning) return;
 
-    // После действия ждём то, что наступит раньше:
-    //  1) реальную загрузку страницы (если клик/navigate привели к полноценному переходу) —
-    //     через loadFinished;
-    //  2) "оседание" страницы без полной перезагрузки (типично для SPA — React/Vue меняют
-    //     DOM через pushState без loadFinished) — через m_pageAgent->waitForSettle(), которое
-    //     само ждёт отсутствия DOM-мутаций некоторое время вместо слепого фиксированного
-    //     таймера, но не дольше fallbackDelayMs.
-    // Флаг proceeded защищает от двойного вызова, если оба пути сработают почти одновременно.
+    // Захват поколения: таймеры/loadFinished прошлой задачи не должны дёргать
+    // sendAgentRequest новой (см. m_taskGeneration).
+    const int gen = m_taskGeneration;
     auto proceeded = std::make_shared<bool>(false);
     auto conn = std::make_shared<QMetaObject::Connection>();
 
     QWebEngineView* view = m_pageAgent->targetView();
     if (view) {
-        *conn = connect(view->page(), &QWebEnginePage::loadFinished, this, [this, proceeded, conn](bool) {
+        *conn = connect(view->page(), &QWebEnginePage::loadFinished, this, [this, proceeded, conn, gen](bool) {
             if (*proceeded) return;
             *proceeded = true;
             QObject::disconnect(*conn);
-            if (m_agentRunning) sendAgentRequest();
+            if (m_agentRunning && gen == m_taskGeneration) sendAgentRequest();
             });
     }
 
-    m_pageAgent->waitForSettle([this, proceeded, conn]() {
+    m_pageAgent->waitForSettle([this, proceeded, conn, gen]() {
         if (*proceeded) return;
         *proceeded = true;
         if (*conn) QObject::disconnect(*conn);
-        if (m_agentRunning) sendAgentRequest();
+        if (m_agentRunning && gen == m_taskGeneration) sendAgentRequest();
         }, fallbackDelayMs);
 }
 
 void AIAssistantWidget::finishAgentTask() {
     if (!m_agentRunning) return;
     stopAgentBtn->hide();
+    // Прерываем висящие сетевые запросы задачи — их ответы всё равно будут
+    // отброшены сверкой поколений, но незачем держать соединение и ждать таймаут.
+    if (m_activeAgentReply) m_activeAgentReply->abort();
+    if (m_activeSearchReply) m_activeSearchReply->abort();
     m_pageAgent->endTask(); // Снимает свечение/плашку с зафиксированной вкладки задачи и отпускает её
     setUIEnabled(true);
     m_agentRunning = false;
@@ -1182,8 +1355,24 @@ void AIAssistantWidget::finishAgentTask() {
 }
 
 void AIAssistantWidget::onStopAgentClicked() {
-    if (!m_agentRunning) return;
-    chatHistory.append(ChatMessage{ "assistant", u8"🛑 Остановлено пользователем." });
-    renderChat();
-    finishAgentTask();
+    // Агентный цикл — штатная остановка
+    if (m_agentRunning) {
+        chatHistory.append(ChatMessage{ "assistant", u8"🛑 Остановлено пользователем.", true });
+        renderChat();
+        finishAgentTask();
+        return;
+    }
+    // Фазы классификации/простого ответа/поиска — раньше прервать их было НЕЛЬЗЯ
+    // (кнопка была скрыта, а поле ввода заблокировано): зависший запрос держал
+    // панель мёртвой до перезапуска браузера.
+    if (m_busy) {
+        if (m_activeQuickReply) m_activeQuickReply->abort();
+        if (m_activeSearchReply) m_activeSearchReply->abort();
+        if (m_activeAgentReply) m_activeAgentReply->abort();
+        m_busy = false;
+        stopAgentBtn->hide();
+        setUIEnabled(true);
+        chatHistory.append(ChatMessage{ "assistant", u8"🛑 Остановлено пользователем." });
+        renderChat();
+    }
 }

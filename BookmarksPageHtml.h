@@ -128,6 +128,34 @@ inline QString getBookmarksHtml()
     }
     .dropdown-item:hover { background: var(--hover); }
 
+    /* Менеджер сессий (дропдаун «💾 Сессии»): те же материалы, что и у
+       «Управления вкладками», плюс список сохранённых сессий с прокруткой. */
+    .sessions-menu { min-width: 330px; max-height: 400px; overflow-y: auto; }
+    .dropdown-separator { height: 1px; background: var(--border); margin: 4px 2px; flex: 0 0 auto; }
+    .session-save-item { color: var(--accent); font-weight: 600; }
+    .session-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+    }
+    .session-row:hover { background: var(--hover); }
+    .session-icon { flex: 0 0 auto; font-size: 15px; }
+    .session-info { flex: 1 1 auto; min-width: 0; }
+    .session-name {
+        font-size: 12.5px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .session-meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
+    .session-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; flex: 0 0 auto; }
+    .session-row:hover .session-actions { opacity: 1; }
+    .dropdown-empty { padding: 12px 10px; font-size: 12px; color: var(--muted); }
+
     #list { padding: 8px 12px 24px; max-width: 720px; margin: 0 auto; }
 
     /* Папки */
@@ -305,6 +333,15 @@ inline QString getBookmarksHtml()
                 <button class="dropdown-item" id="btnExportTabs" role="menuitem">📤 Экспорт вкладок (HTML)</button>
             </div>
         </div>
+        <div class="dropdown" id="sessionsDropdown">
+            <button class="tbtn" id="btnSessions" aria-haspopup="true" aria-expanded="false">💾 Сессии ▾</button>
+            <div class="dropdown-menu sessions-menu" id="sessionsList" role="menu">
+                <button class="dropdown-item session-save-item" id="btnSaveSession" role="menuitem">➕ Сохранить текущую сессию…</button>
+                <div class="dropdown-separator"></div>
+                <div id="sessionsItems"></div>
+                <div class="dropdown-empty" id="sessionsEmpty">Сохранённых сессий пока нет</div>
+            </div>
+        </div>
         <button class="tbtn" id="btnNewFolder">🗀 Новая папка</button>
         <button class="tbtn tbtn-danger" id="btnClearAll">🧹 Очистить все закладки</button>
     </div>
@@ -347,6 +384,7 @@ inline QString getBookmarksHtml()
     var bridge = null;
     var allBookmarks = [];   // плоский список: {title,url,icon,folderId,folderName}
     var folders = [];        // [{id,name}], в порядке отображения
+    var sessions = [];       // [{id,name,createdText,tabCount}] — менеджер сессий
     var draggedUrl = null;
     var draggedFolderId = null;
     var collapsedFolders = {}; // состояние сворачивания папок держим на время сессии страницы
@@ -889,6 +927,156 @@ inline QString getBookmarksHtml()
         });
     }
 
+    // ---------- Менеджер сессий ----------
+    // Сессия — снимок открытых вкладок основного окна: сохранить под именем,
+    // потом открыть все разом. Живёт тут же, в разделе закладок, потому что
+    // это «закладка на весь набор вкладок сразу».
+
+    function loadSessions() {
+        if (!bridge) return;
+        bridge.getSessions(function (json) {
+            try { sessions = JSON.parse(json); } catch (e) { sessions = []; }
+            renderSessions();
+        });
+    }
+
+    function renderSessions() {
+        var box = document.getElementById('sessionsItems');
+        var emptyEl = document.getElementById('sessionsEmpty');
+        if (!box || !emptyEl) return;
+        box.innerHTML = '';
+        emptyEl.style.display = sessions.length ? 'none' : 'block';
+
+        sessions.forEach(function (s) {
+            var row = document.createElement('div');
+            row.className = 'session-row';
+            row.title = 'Открыть все вкладки этой сессии';
+
+            var icon = document.createElement('span');
+            icon.className = 'session-icon';
+            icon.textContent = '🗂';
+            row.appendChild(icon);
+
+            var info = document.createElement('div');
+            info.className = 'session-info';
+            var name = document.createElement('div');
+            name.className = 'session-name';
+            name.textContent = s.name;
+            var meta = document.createElement('div');
+            meta.className = 'session-meta';
+            meta.textContent = s.tabCount + ' вкладок · ' + (s.createdText || '');
+            info.appendChild(name);
+            info.appendChild(meta);
+            row.appendChild(info);
+
+            var actions = document.createElement('div');
+            actions.className = 'session-actions';
+
+            var renameBtn = document.createElement('button');
+            renameBtn.className = 'icon-btn';
+            renameBtn.textContent = '✏️';
+            renameBtn.title = 'Переименовать сессию';
+            renameBtn.setAttribute('aria-label', 'Переименовать сессию');
+            renameBtn.addEventListener('click', function (e) {
+                e.stopPropagation(); // не открываем сессию кликом по строке
+                closeSessionsMenu();
+                showPromptModal({
+                    title: 'Переименовать сессию',
+                    label: 'Новое название',
+                    defaultValue: s.name,
+                    confirmLabel: 'Сохранить',
+                    onConfirm: function (newName) {
+                        bridge.renameSession(s.id, newName, function (err) {
+                            if (err) { showAlertModal(err); } else { loadSessions(); }
+                        });
+                    }
+                });
+            });
+            actions.appendChild(renameBtn);
+
+            var delBtn = document.createElement('button');
+            delBtn.className = 'icon-btn';
+            delBtn.textContent = '🗑️';
+            delBtn.title = 'Удалить сессию';
+            delBtn.setAttribute('aria-label', 'Удалить сессию');
+            delBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                closeSessionsMenu();
+                showConfirmModal({
+                    title: 'Удалить сессию',
+                    message: 'Удалить сессию «' + s.name + '»? Открытые вкладки не пострадают — удалится только сохранённый снимок.',
+                    confirmLabel: 'Удалить',
+                    danger: true,
+                    onConfirm: function () {
+                        bridge.deleteSession(s.id, function (err) {
+                            if (err) { showAlertModal(err); } else { loadSessions(); }
+                        });
+                    }
+                });
+            });
+            actions.appendChild(delBtn);
+
+            row.appendChild(actions);
+
+            // Клик по строке — восстановить сессию (с подтверждением:
+            // одним движением открывается до 20 вкладок, защита от промаха).
+            row.addEventListener('click', function () {
+                closeSessionsMenu();
+                showConfirmModal({
+                    title: 'Открыть сессию',
+                    message: 'Открыть ' + s.tabCount + ' вкладок из сессии «' + s.name + '»? Текущие вкладки закрываться не будут.',
+                    confirmLabel: 'Открыть',
+                    onConfirm: function () {
+                        bridge.restoreSession(s.id, function (json) {
+                            var r = null;
+                            try { r = JSON.parse(json); } catch (e) {}
+                            if (!r || !r.ok) {
+                                showAlertModal(r && r.error ? r.error : 'Не удалось открыть сессию.');
+                                return;
+                            }
+                            if (r.limited) {
+                                showAlertModal('Открыто 20 вкладок — остальные пропущены для экономии памяти. Остальные вкладки можно дооткрыть, повторив запуск сессии.', 'Открыто с ограничением');
+                            }
+                            loadSessions();
+                        });
+                    }
+                });
+            });
+
+            box.appendChild(row);
+        });
+    }
+
+    // Имя по умолчанию для новой сессии: «Сессия от 07.10 21:30» —
+    // пользователь сразу видит, когда сделал снимок, и может переименовать.
+    function suggestSessionName() {
+        var d = new Date();
+        var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+        return 'Сессия от ' + pad(d.getDate()) + '.' + pad(d.getMonth() + 1) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+
+    function saveSessionPrompt() {
+        closeSessionsMenu();
+        showPromptModal({
+            title: 'Сохранить текущую сессию',
+            label: 'Название сессии (все открытые вкладки запомнятся под ним)',
+            defaultValue: suggestSessionName(),
+            confirmLabel: 'Сохранить',
+            onConfirm: function (name) {
+                bridge.saveCurrentSession(name, function (err) {
+                    if (err) { showAlertModal(err); } else { loadSessions(); }
+                });
+            }
+        });
+    }
+
+    function closeSessionsMenu() {
+        var list = document.getElementById('sessionsList');
+        var btn = document.getElementById('btnSessions');
+        if (list) list.classList.remove('visible');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+    }
+
     // ---------- Инициализация ----------
 
     document.addEventListener('DOMContentLoaded', function () {
@@ -919,16 +1107,33 @@ inline QString getBookmarksHtml()
             var isOpen = tabsMenuList.classList.toggle('visible');
             tabsMenuBtn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
         });
+
+        // Дропдаун "Сессии" — при каждом открытии освежаем список:
+        // сессии могли сохраниться из другого места или устареть.
+        var sessionsBtn = document.getElementById('btnSessions');
+        sessionsBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var isOpen = document.getElementById('sessionsList').classList.toggle('visible');
+            sessionsBtn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+            if (isOpen) loadSessions();
+        });
+
         document.addEventListener('click', function () {
             tabsMenuList.classList.remove('visible');
             tabsMenuBtn.setAttribute('aria-expanded', 'false');
+            closeSessionsMenu();
         });
         document.addEventListener('keydown', function (e) {
             if (e.key === 'Escape') {
                 tabsMenuList.classList.remove('visible');
                 tabsMenuBtn.setAttribute('aria-expanded', 'false');
+                closeSessionsMenu();
                 closeActionModal();
             }
+        });
+
+        document.getElementById('btnSaveSession').addEventListener('click', function () {
+            saveSessionPrompt();
         });
 
         document.getElementById('btnImportedTabs').addEventListener('click', function () {

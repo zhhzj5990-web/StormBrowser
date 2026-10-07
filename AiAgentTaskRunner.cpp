@@ -54,20 +54,22 @@ static QString actionSignature(const QJsonObject& action) {
 // action — в чате его нет, потому что человек сам читает "message" и судит
 // об итоге, а здесь по этому флагу выбирается markPublished/markFailed.
 static QString taskAgentSystemPrompt() {
-    return QString::fromUtf8(u8R"PROMPT(Ты Storm AI — ассистент, встроенный в браузер Storm Browser, выполняешь ОДНУ конкретную фоновую задачу без участия пользователя в реальном времени (он увидит только итоговый результат, не переписку). Ты видишь текст текущей открытой страницы и список её видимых интерактивных элементов (ссылки, кнопки, поля ввода), и можешь взаимодействовать со страницей: найти нужный элемент, заполнить и отправить форму, перейти по ссылке и так далее — чтобы довести задачу до конца.
+    return QString::fromUtf8(u8R"PROMPT(Ты Storm AI — ассистент, встроенный в браузер Storm Browser, выполняешь ОДНУ конкретную фоновую задачу без участия пользователя в реальном времени (он увидит только итоговый результат, не переписку). Ты видишь текст текущей открытой страницы (он может быть ОБРЕЗАН — тогда используй scroll, чтобы добраться до содержимого ниже) и список её видимых интерактивных элементов (ссылки, кнопки, поля ввода), и можешь взаимодействовать со страницей: найти нужный элемент, заполнить и отправить форму, перейти по ссылке и так далее — чтобы довести задачу до конца.
 
 Каждый интерактивный элемент приходит с числовым полем "id" — используй именно это число как "target" в своём действии, не пытайся придумывать CSS-селекторы или XPath.
 
 Отвечай СТРОГО одним JSON-объектом, без какого-либо текста до или после него, в формате:
-{"message": "краткое пояснение текущего шага или итогового результата", "action": {"type": "click | type | scroll | navigate | done", "target": <id элемента для click/type/scroll>, "target_text": "точный видимый текст элемента (запасной вариант для click)", "value": "текст для ввода при type", "url": "адрес при navigate", "success": <true/false — ТОЛЬКО когда type == "done">}}
+{"message": "краткое пояснение текущего шага или итогового результата", "action": {"type": "click | type | scroll | navigate | press_enter | done", "target": <id элемента для click/type/scroll/press_enter, число>, "target_text": "точный видимый текст/подсказка элемента (запасной вариант для click/type)", "value": "текст для ввода при type", "url": "адрес при navigate (только http/https)", "direction": "up или down — для scroll без target (по умолчанию down)", "amount": <процент высоты окна для scroll, 10–300, по умолчанию 80>, "success": <true/false — ТОЛЬКО когда type == "done">}}
 
 Правила:
-- Одно действие за один ответ. После выполнения тебе пришлют обновлённое состояние страницы, и ты сможешь продолжить.
-- Для click в первую очередь используй "target" (id из списка elements). Если нужный элемент виден в тексте страницы, но НЕ попал в список elements — верни "action":{"type":"click"} с "target_text" вместо "target" — система сама найдёт и нажмёт его.
+- Одно действие за один ответ. После выполнения тебе придёт обновлённое состояние страницы, и ты сможешь продолжить.
+- Для click/type в первую очередь используй "target" (id из списка elements). Если нужный элемент виден в тексте страницы, но НЕ попал в список elements — верни action с "target_text" вместо "target" — система сама найдёт элемент по нему (для type это placeholder/подпись/aria-label поля).
 - Действие "look" (снимок экрана для визуального анализа) в этом режиме НЕДОСТУПНО — не используй его, разбирайся по тексту/списку элементов и попробуй другой способ (другой элемент, scroll, click по target_text вместо id).
-- Никогда не угадывай адрес для "navigate" внутри того же сайта (не выдумывай /ссылки/, /id, /слаги). Для перехода внутри сайта всегда предпочитай click/target_text.
+- "press_enter" — нажать Enter в поле (отправка формы, подтверждение). Удобно, когда кнопка отправки не находится.
+- Никогда не угадывай адрес для "navigate" внутри того же сайта (не выдумывай /ссылки/, /id, /слаги). Для перехода внутри сайта всегда предпочитай click/target_text. Исключение — когда задана ЦЕЛЬ ПУБЛИКАЦИИ и текущая страница ей не соответствует: тогда navigate разрешён строго на адрес цели.
 - Если предыдущее действие завершилось со статусом "не удалось" ИЛИ страница не изменилась — не повторяй его в том же виде. Попробуй другой способ.
 - Прежде чем считать, что ты уже на нужном разделе/форме — сверяйся со строками "Текущий адрес (URL)" и "Заголовок вкладки", а не только с текстом на странице.
+- В состоянии страницы указано, сколько шагов осталось до принудительной остановки: если задача ещё не закончена — действуй эффективнее, без лишних промежуточных шагов.
 - Когда задача выполнена, невозможна или зашла в тупик после нескольких разных попыток — верни "action": {"type": "done", "success": true или false}. success=true ТОЛЬКО если задача реально доведена до конца (например, форма отправлена и это подтверждено изменением страницы) — если сомневаешься или не можешь убедиться, ставь success=false и честно объясни причину в "message".
 - Никогда не выдумывай данные, которых нет на странице. Не совершай необратимые или чувствительные действия, не относящиеся напрямую к описанной задаче.)PROMPT");
 }
@@ -81,9 +83,14 @@ AiAgentTaskRunner::AiAgentTaskRunner(WebPageAgent* agent, QObject* parent)
 void AiAgentTaskRunner::run(const QString& taskDescription, int maxSteps) {
     m_taskDescription = taskDescription;
     m_maxSteps = maxSteps > 0 ? maxSteps : MAX_STEPS; // защита от случайного 0/отрицательного значения снаружи
-    m_history.append(AgentMsg{ "user", taskDescription });
+    // Исходная задача БОЛЬШЕ не кладётся в m_history — она вставляется в запрос
+    // отдельным сообщением на каждом шаге (см. sendStep) и потому не может быть
+    // вытеснена скользящим окном истории: раньше после ~9 шагов исходная задача
+    // выпадала из контекста, и модель продолжала работать «без цели» — главная
+    // причина «агент забыл, что от него просили».
     m_running = true;
     m_stepCount = 0;
+    m_jsonRetries = 0;
     sendStep();
 }
 
@@ -179,6 +186,13 @@ void AiAgentTaskRunner::sendStep() {
         QJsonArray messagesArray;
         messagesArray.append(sysMsg);
 
+        // ЗАКРЕПЛЁННАЯ исходная задача — всегда первым user-сообщением, независимо
+        // от размера истории промежуточных шагов (см. run()).
+        QJsonObject taskMsg;
+        taskMsg["role"] = "user";
+        taskMsg["content"] = m_taskDescription;
+        messagesArray.append(taskMsg);
+
         for (const auto& msg : m_history) {
             QJsonObject m; m["role"] = msg.role; m["content"] = msg.content;
             messagesArray.append(m);
@@ -199,6 +213,15 @@ void AiAgentTaskRunner::sendStep() {
                 verificationNote = changed
                     ? u8"\nПроверка: страница изменилась после последнего действия."
                     : u8"\nПроверка: страница НЕ изменилась после последнего действия — вероятно, клик пришёлся мимо, элемент не тот, или нужен другой способ.";
+            }
+            // Предупреждение о бюджете шагов: модель знает, сколько осталось, и
+            // не тратит задел на пустые промежуточные действия.
+            int stepsLeft = m_maxSteps - m_stepCount + 1;
+            if (stepsLeft <= 5) {
+                verificationNote += u8"\nОсталось шагов до принудительной остановки: " + QString::number(stepsLeft) + u8".";
+            }
+            if (page.value("textTruncated").toBool()) {
+                verificationNote += u8"\nТекст страницы обрезан (страница длинная) — нужное может быть ниже: используй scroll (direction: down).";
             }
             m_lastSeenUrl = url;
             m_lastSeenPageText = bodyText;
@@ -308,6 +331,20 @@ void AiAgentTaskRunner::onNetworkReply(QNetworkReply* reply) {
     if (reply->error() != QNetworkReply::NoError) {
         int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
 
+        // GigaChat: 401 в середине задачи — кэшированный токен протух между шагами
+        // (живёт 1740 с). Без этой ветки один просроченный токен убивал всю задачу
+        // целиком после нескольких минут чтения страницы. Сбрасываем токен и
+        // повторяем шаг — ensureGigaChatToken получит новый.
+        if (statusCode == 401
+            && QSettings().value("ai/mode", 0).toInt() == 2
+            && !m_cachedGigaToken.isEmpty()) {
+            m_cachedGigaToken.clear();
+            m_gigaTokenExpireTime = 0;
+            m_stepCount--; // повтор из-за авторизации не считается полноценным шагом
+            QTimer::singleShot(500, this, [this]() { if (m_running) sendStep(); });
+            return;
+        }
+
         // Различаем "сервер явно отказал" (неверный ключ, битый запрос —
         // повтор того же самого не поможет) от "временная неполадка"
         // (таймаут/перегрузка/сеть моргнула — часто самоустраняется за
@@ -387,6 +424,24 @@ void AiAgentTaskRunner::onNetworkReply(QNetworkReply* reply) {
         action = parsed.value("action").toObject();
     }
     else {
+        // Модель обернула JSON посторонним текстом/оборвала ответ. Раньше задача
+        // мгновенно умирала на этом — теперь даём ОДНУ попытку исправить формат
+        // (не съедает бюджет шагов), и только при повторном провале завершаемся.
+        if (m_jsonRetries < kMaxJsonRetries) {
+            m_jsonRetries++;
+            m_stepCount--; // повтор из-за формата не считается полноценным шагом агента
+            if (!content.isEmpty()) {
+                m_history.append(AgentMsg{ "assistant", content.left(600) });
+                if (m_history.size() > 10) m_history.removeFirst();
+            }
+            m_history.append(AgentMsg{ "user",
+                u8"[Твой прошлый ответ не удалось разобрать как JSON-объект нужного формата. "
+                u8"Повтори ответ СТРОГО одним JSON-объектом {\"message\":\"...\",\"action\":{...}} "
+                u8"без какого-либо текста до или после.]" });
+            if (m_history.size() > 10) m_history.removeFirst();
+            QTimer::singleShot(300, this, [this]() { if (m_running) sendStep(); });
+            return;
+        }
         finishWith(false, content.isEmpty() ? u8"Сервер вернул пустой ответ или неизвестный формат." : content);
         return;
     }
@@ -420,10 +475,10 @@ void AiAgentTaskRunner::onNetworkReply(QNetworkReply* reply) {
     // executeAction() как "неизвестное" без внятной причины в логе. Явно
     // отсекаем и просим модель исправиться, вместо того чтобы передавать
     // непонятно что дальше в WebPageAgent.
-    static const QSet<QString> kKnownActions = { "click", "type", "scroll", "navigate" };
+    static const QSet<QString> kKnownActions = { "click", "type", "scroll", "navigate", "press_enter" };
     if (!kKnownActions.contains(actionType)) {
         m_history.append(AgentMsg{ "user",
-            QString(u8"[Неизвестный тип действия \"%1\" — используй только click/type/scroll/navigate/done.]").arg(actionType) });
+            QString(u8"[Неизвестный тип действия \"%1\" — используй только click/type/scroll/navigate/press_enter/done.]").arg(actionType) });
         sendStep();
         return;
     }
@@ -446,6 +501,7 @@ void AiAgentTaskRunner::onNetworkReply(QNetworkReply* reply) {
     else if (actionType == "type") stepLabel = u8"ввожу текст в поле…";
     else if (actionType == "scroll") stepLabel = u8"прокручиваю страницу…";
     else if (actionType == "navigate") stepLabel = u8"перехожу по ссылке…";
+    else if (actionType == "press_enter") stepLabel = u8"нажимаю Enter…";
     m_agent->updateStatus(stepLabel);
 
     m_agent->executeAction(action, [this, actionType, sig](bool success, const QString& /*detail*/) {
@@ -459,34 +515,41 @@ void AiAgentTaskRunner::onNetworkReply(QNetworkReply* reply) {
 
         m_lastActionSummary = QString(u8"[%1] — %2").arg(actionType, success ? u8"выполнено" : u8"не удалось (элемент не найден или устарел, список элементов будет обновлён)");
 
-        int fallbackDelay = (actionType == "navigate") ? 8000 : 900;
-        scheduleNextStep(fallbackDelay);
+        scheduleNextStep(actionType == "navigate");
         });
 }
 
-void AiAgentTaskRunner::scheduleNextStep(int fallbackDelayMs) {
+void AiAgentTaskRunner::scheduleNextStep(bool isNavigation) {
     if (!m_running) return;
 
-    // Идентичная защита от двойного запуска, что и в
-    // AIAssistantWidget::scheduleNextAgentStep — ждём либо реальной загрузки
-    // страницы, либо fallback-таймаут, смотря что наступит раньше.
+    // Ждём «успокоения» страницы после действия: у ВК и других SPA перерисовка
+    // после клика/ввода легко занимает больше старой слепой паузы в 900 мс —
+    // следующий снимок захватывался «на лету», и заметка «страница НЕ изменилась»
+    // ошибочно отправляла модель повторять уже выполненное действие.
+    // WebPageAgent::waitForSettle ждёт тишины DOM (MutationObserver, 250 мс без
+    // мутаций) с потолком ожидания.
     auto proceeded = std::make_shared<bool>(false);
-    auto conn = std::make_shared<QMetaObject::Connection>();
-
-    QWebEngineView* view = m_agent->targetView();
-    if (view) {
-        *conn = connect(view->page(), &QWebEnginePage::loadFinished, this, [this, proceeded, conn](bool) {
-            if (*proceeded) return;
-            *proceeded = true;
-            QObject::disconnect(*conn);
-            if (m_running) sendStep();
-            });
-    }
-
-    QTimer::singleShot(fallbackDelayMs, this, [this, proceeded, conn]() {
+    auto settleAndContinue = [this, proceeded]() {
         if (*proceeded) return;
         *proceeded = true;
-        if (*conn) QObject::disconnect(*conn);
-        if (m_running) sendStep();
-        });
+        m_agent->waitForSettle([this]() { if (m_running) sendStep(); }, 2500);
+    };
+
+    if (isNavigation) {
+        // Для navigate: сначала реальная загрузка страницы (loadFinished),
+        // либо потолок 8 с (медленная сеть/зависший сайт), затем — пауза
+        // дорисовки SPA через waitForSettle.
+        auto conn = std::make_shared<QMetaObject::Connection>();
+        QWebEngineView* view = m_agent->targetView();
+        if (view && view->page()) {
+            *conn = connect(view->page(), &QWebEnginePage::loadFinished, this, [proceeded, settleAndContinue](bool) {
+                if (*proceeded) return;
+                settleAndContinue();
+                });
+        }
+        QTimer::singleShot(8000, this, [settleAndContinue]() { settleAndContinue(); });
+    }
+    else {
+        settleAndContinue();
+    }
 }

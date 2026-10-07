@@ -11,6 +11,13 @@ class BrowserWebView : public QWebEngineView {
 public:
     explicit BrowserWebView(MainWindow* mw, QWidget* parent = nullptr);
 
+    // P1-2/C-2: окно-владелец этой вкладки. Обновляется при переносе вкладки
+    // в другое окно (MainWindow::attachTab) — раньше указатель навсегда
+    // оставался на окне, где вкладку СОЗДАЛИ, и после его закрытия любой
+    // контекстный меню/действие роняли браузер (use-after-free).
+    void setOwnerMainWindow(MainWindow* mw) { mainWindow = mw; }
+    MainWindow* ownerMainWindow() const { return mainWindow; }
+
     // Разрешения сайта (камера/микрофон/геолокация/уведомления и т.д.) — НЕ
     // подключает сигнал сама (это уже делает существующий обработчик
     // featurePermissionRequested в MainWindow::addNewTab(), который решает
@@ -45,6 +52,11 @@ private:
     // проставлен. Если сохранённых адресов несколько — сначала спрашивает,
     // какой из них использовать.
     void insertSavedAddress();
+
+    // v1.2.9 Web-clipper: сохранить выделенный текст страницы в Заметки
+    // (боковая панель 📝) — с датой и строкой источника. Вызывается из
+    // контекстного меню, когда есть выделение.
+    void saveClippingToNotes(const QString& text);
 
     // Добавляет слово в пользовательский словарь спеллчекера: дописывает
     // его в .dic_delta текущего языка, пересобирает .bdic через

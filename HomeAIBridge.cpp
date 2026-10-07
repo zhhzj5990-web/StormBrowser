@@ -352,6 +352,26 @@ QString HomeAIBridge::buildSearchEngineUrl(const QString& query) const {
     return searchUrl + QUrl::toPercentEncoding(query);
 }
 
+void HomeAIBridge::askAIWebSearch(const QString& prompt) {
+    // Режим «🌐 Поиск» с главной страницы: как askAI, кладём вопрос в историю
+    // бэкенда (чтобы «финальный» ответ опирался на контекст), но вместо чата
+    // сразу выполняем живой поиск.
+    QString cleanPrompt = prompt.trimmed();
+    if (cleanPrompt.isEmpty()) return;
+
+    if (m_pendingReply) {
+        m_pendingReply->abort();
+        m_pendingReply = nullptr;
+    }
+
+    m_chatHistory.append(QJsonObject{ {"role", "user"}, {"content", cleanPrompt} });
+    while (m_chatHistory.size() > 10) {
+        m_chatHistory.removeFirst();
+    }
+
+    performHomeSearch(cleanPrompt);
+}
+
 void HomeAIBridge::performHomeSearch(const QString& query) {
     QString trimmedQuery = query.trimmed();
     if (trimmedQuery.isEmpty()) return;
@@ -366,9 +386,22 @@ void HomeAIBridge::performHomeSearch(const QString& query) {
         return;
     }
 
+    // «Предохранитель»: если Tavily стабильно падал (3 запроса подряд не
+    // прошли все попытки), на 30 минут уходим в режим прямого перенаправления
+    // на поисковик — не ждём по 4 попытки на каждый новый вопрос.
+    const qint64 cooldownUntil = settings.value("ai/tavily_cooldown_until", 0).toLongLong();
+    if (QDateTime::currentSecsSinceEpoch() < cooldownUntil) {
+        emit aiResponseReceived("NAVIGATE_CMD:" + buildSearchEngineUrl(trimmedQuery));
+        return;
+    }
+
+    sendTavilyRequest(trimmedQuery, tavilyKey, /*attempt=*/1);
+}
+
+void HomeAIBridge::sendTavilyRequest(const QString& query, const QString& tavilyKey, int attempt) {
     QJsonObject body;
     body["api_key"] = tavilyKey;
-    body["query"] = trimmedQuery;
+    body["query"] = query;
     body["search_depth"] = QString("basic");
     body["include_answer"] = true;
     body["max_results"] = 5;
@@ -384,17 +417,44 @@ void HomeAIBridge::performHomeSearch(const QString& query) {
     }
 
     QNetworkReply* reply = m_searchManager->post(request, QJsonDocument(body).toJson());
-    reply->setProperty("stormSearchQuery", trimmedQuery);
+    reply->setProperty("stormSearchQuery", query);
+    reply->setProperty("stormSearchAttempt", attempt);
 }
 
 void HomeAIBridge::onSearchNetworkReply(QNetworkReply* reply) {
     reply->deleteLater();
     QString query = reply->property("stormSearchQuery").toString();
+    int attempt = reply->property("stormSearchAttempt").toInt();
+
+    // Универсальный финальный фолбэк: 4-я неудача (или мгновенно, если попыток
+    // уже не осталось) — перенаправляем запрос на поисковик, который стоит по
+    // умолчанию в настройках браузера (Yandex/Google/DuckDuckGo/Bing).
+    auto fallbackToSearchEngine = [this, query]() {
+        QSettings settings;
+        int streak = settings.value("ai/tavily_fail_streak", 0).toInt() + 1;
+        settings.setValue("ai/tavily_fail_streak", streak);
+        if (streak >= 3) {
+            // Три запроса подряд не прошли даже со всеми попытками — включаем
+            // 30-минутный «предохранитель» (см. performHomeSearch).
+            settings.setValue("ai/tavily_cooldown_until",
+                QDateTime::currentSecsSinceEpoch() + 30 * 60);
+            settings.setValue("ai/tavily_fail_streak", 0);
+        }
+        emit aiResponseReceived("NAVIGATE_CMD:" + buildSearchEngineUrl(query));
+        };
 
     if (reply->error() != QNetworkReply::NoError) {
-        // Сетевая ошибка/просроченный лимит Tavily — не оставляем пользователя без ответа,
-        // откатываемся на тот же fallback, что и при отсутствующем ключе.
-        emit aiResponseReceived("NAVIGATE_CMD:" + buildSearchEngineUrl(query));
+        // Сетевая ошибка/просроченный лимит Tavily: до 3 попыток повторяем
+        // (краткая пауза — сеть могла моргнуть), на 4-й раз — поисковик.
+        if (attempt < 3) {
+            emit aiResponseReceived(QString::fromUtf8(u8"STATUS:Поиск в интернете (попытка %1 из 3)…").arg(attempt));
+            QString q = query, key = QSettings().value("research/tavily_key", "").toString().trimmed();
+            QTimer::singleShot(900, this, [this, q, key, attempt]() {
+                sendTavilyRequest(q, key, attempt + 1);
+                });
+            return;
+        }
+        fallbackToSearchEngine();
         return;
     }
 
@@ -421,11 +481,21 @@ void HomeAIBridge::onSearchNetworkReply(QNetworkReply* reply) {
     }
 
     if (summary.trimmed().isEmpty()) {
-        // Tavily ответил без ошибки, но пусто по существу — тот же fallback на поисковик.
-        emit aiResponseReceived("NAVIGATE_CMD:" + buildSearchEngineUrl(query));
+        // Tavily ответил без ошибки, но пусто по существу — это тоже «неудача»
+        // для нашей цепочки: те же 3 попытки, затем поисковик.
+        if (attempt < 3) {
+            QString q = query, key = QSettings().value("research/tavily_key", "").toString().trimmed();
+            QTimer::singleShot(600, this, [this, q, key, attempt]() {
+                sendTavilyRequest(q, key, attempt + 1);
+                });
+            return;
+        }
+        fallbackToSearchEngine();
         return;
     }
 
+    // Успех — сбрасываем счётчик неудач.
+    QSettings().setValue("ai/tavily_fail_streak", 0);
     sendGroundedFollowup(query, summary);
 }
 

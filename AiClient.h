@@ -53,6 +53,11 @@ public:
         bool wantJsonObjectFormat = false, const QVariant& payload = QVariant(),
         const QString& meterKind = QString());
 
+    // Немедленно прервать активный запрос (abort) — используется для отзывчивой
+    // отмены: без этого «Остановить» в Deep Research лишь ставило флаг, а сам
+    // запрос (до 120 с у LLM) продолжал лететь, и UI висел в «⏹ Отмена…».
+    void cancel();
+
 signals:
     void replyReceived(const QString& requestId, const QString& content, const QVariant& payload);
 
@@ -82,4 +87,5 @@ private:
     QNetworkAccessManager* m_net = nullptr;
     QString m_cachedGigaToken;
     qint64 m_gigaTokenExpireTime = 0;
+    class QNetworkReply* m_activeReply = nullptr; // QPointer не обязателен: reply — ребёнок m_net, а manager живёт пока жив AiClient
 };

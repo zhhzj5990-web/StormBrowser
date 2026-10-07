@@ -241,6 +241,12 @@ public:
 
 static const char* const kStormTabMimeType = "application/x-storm-tab";
 
+// Статические общие профили — см. объявление в MainWindow.h (C-1/C-7).
+// Определения обязаны быть ровно в одной единице трансляции.
+QWebEngineProfile* MainWindow::s_sharedMainProfile = nullptr;
+QWebEngineProfile* MainWindow::s_incognitoProfile = nullptr;
+QWebEngineProfile* MainWindow::s_arcadeProfile = nullptr;
+
 
 class TabDragDropFilter : public QObject {
     MainWindow* mainWindow;
@@ -254,7 +260,13 @@ public:
 
     bool eventFilter(QObject* obj, QEvent* event) override {
         switch (event->type()) {
+        // Старт перетаскивания вкладки ловим ТОЛЬКО на полосе вкладок.
+        // Этот же фильтр теперь стоит и на самих BrowserWebView (чтобы
+        // принимать drop по всей площади окна — см. setupUi/wireTab), и
+        // без этой проверки протяжка мыши по веб-странице (выделение
+        // текста) ошибочно стартовала бы перетаскивание вкладки.
         case QEvent::MouseButtonPress: {
+            if (obj != tabWidget->tabBar()) break;
             QMouseEvent* me = static_cast<QMouseEvent*>(event);
             if (me->button() == Qt::LeftButton) {
                 dragStartPos = me->pos();
@@ -263,6 +275,7 @@ public:
             break;
         }
         case QEvent::MouseMove: {
+            if (obj != tabWidget->tabBar()) break;
             QMouseEvent* me = static_cast<QMouseEvent*>(event);
             if (!isDetaching && (me->buttons() & Qt::LeftButton)) {
                 if ((me->pos() - dragStartPos).manhattanLength() > 50 && !tabWidget->tabBar()->geometry().contains(me->pos())) {
@@ -277,8 +290,24 @@ public:
             break;
         }
         case QEvent::MouseButtonRelease:
+            if (obj != tabWidget->tabBar()) break;
             isDetaching = false;
             break;
+
+        // QWebEngineView создаёт свои внутренние дочерние виджеты уже
+        // ПОСЛЕ вставки вкладки (при первой загрузке страницы), и именно
+        // они перехватывают drag-события над веб-контентом раньше всех.
+        // Вешаем фильтр на каждого нового ребёнка — тогда бросить вкладку
+        // можно в любую точку окна, а не только прицелиться в полоску
+        // вкладок (прежнее поведение: промах — и вместо возврата
+        // открывалось очередное новое окно).
+        case QEvent::ChildAdded: {
+            QChildEvent* ce = static_cast<QChildEvent*>(event);
+            if (QObject* child = ce->child()) {
+                child->installEventFilter(this);
+            }
+            break;
+        }
 
         case QEvent::DragEnter: {
             auto* de = static_cast<QDragEnterEvent*>(event);
@@ -301,7 +330,17 @@ public:
             if (de->mimeData()->hasFormat(kStormTabMimeType)) {
                 auto* stormMime = static_cast<const StormTabMimeData*>(de->mimeData());
 
-                int dropIndex = tabWidget->tabBar()->tabAt(de->position().toPoint());
+                // Точка сброса приходит в координатах виджета-приёмника
+                // (это может быть и полоса вкладок, и web-страница) —
+                // переводим её в координаты полосы вкладок.
+                QWidget* dropTarget = qobject_cast<QWidget*>(obj);
+                QPoint barPos = de->position().toPoint();
+                if (dropTarget && dropTarget != tabWidget->tabBar()) {
+                    barPos = tabWidget->tabBar()->mapFromGlobal(
+                        dropTarget->mapToGlobal(barPos));
+                }
+
+                int dropIndex = tabWidget->tabBar()->tabAt(barPos);
                 if (dropIndex < 0 || dropIndex >= tabWidget->count()) {
                     dropIndex = tabWidget->count() > 0 ? tabWidget->count() : 0;
                 }
@@ -385,6 +424,48 @@ public:
     }
 };
 
+// =========================================================================
+// --- ФИЛЬТР 5: держит кнопку «☰ N ▾» (список всех вкладок) В ЦЕНТРЕ
+// СТРОКИ ВКЛАДОК, а не строкой ниже. Кнопка — corner-виджет QTabWidget,
+// её геометрию Qt считает через стек стилей (SE_TabWidgetRightCorner),
+// и в нашей конфигурации (documentMode + QSS на QTabWidget::pane и
+// QTabBar::tab + кастомный sizeHint полосы из StormTabBar) результирующий
+// rect уезжает на высоту строки вкладок ВНИЗ: на Windows-сборке v1.2.9
+// кнопка «висела» в области страницы, под разделителем полосы. Чинить
+// чужую геометрию по всем версиям/стилям Qt бесполезно — вместо этого
+// после КАЖДОЙ установки геометрии кнопки (Move/Resize/ShowToParent)
+// возвращаем её в центр полосы вкладок. X не трогаем: его по-прежнему
+// считает setCornerWidget — он же резервирует кнопке место, чтобы
+// вкладки и стрелки прокрутки не наезжали. move() внутри фильтра
+// безопасен: Move-событие придёт повторно с уже правильным Y, сравнение
+// оборвёт цикл.
+// =========================================================================
+class TabsListButtonGeometryFilter : public QObject {
+    QPointer<QTabWidget> m_tabs;
+public:
+    explicit TabsListButtonGeometryFilter(QTabWidget* tabs, QObject* parent)
+        : QObject(parent), m_tabs(tabs) {
+    }
+
+    bool eventFilter(QObject* obj, QEvent* event) override {
+        if (event->type() == QEvent::Move || event->type() == QEvent::Resize
+            || event->type() == QEvent::ShowToParent) {
+            QWidget* btn = qobject_cast<QWidget*>(obj);
+            QTabBar* bar = m_tabs ? m_tabs->tabBar() : nullptr;
+            if (btn && bar && bar->height() > 0) {
+                // Полоса — ребёнок того же QTabWidget и при North-положении
+                // начинается с y=0, поэтому центр строки в координатах
+                // QTabWidget = bar->y() + (высота полосы - кнопка) / 2.
+                const int targetY = bar->y()
+                    + (bar->height() - btn->height()) / 2;
+                if (btn->y() != targetY)
+                    btn->move(btn->x(), targetY);
+            }
+        }
+        return QObject::eventFilter(obj, event);
+    }
+};
+
 
 namespace {
     // "HTTPS-only" (Настройки → Конфиденциальность): пытаемся поднять любую
@@ -460,17 +541,32 @@ void MainWindow::setupUi(bool isDetached) {
     centralWidget->setObjectName("centralWidget");
     setCentralWidget(centralWidget);
 
-    m_mainProfile = new QWebEngineProfile("StormMainProfile", this);
+    // ------------------------------------------------------------------
+    // C-1/C-7: ОДИН основной профиль WebEngine на весь процесс. Раньше
+    // каждое окно (включая откреплённые/перенесённые) создавало СВОЙ
+    // QWebEngineProfile("StormMainProfile") на одних и тех же каталогах
+    // Cache/Storage — несколько живых профилей на одном хранилище
+    // Chromium не поддерживает: конкуренция за файловые блокировки, порча
+    // кэша и падения. Кроме того, профиль умирал вместе со своим окном,
+    // а вкладки, перенесённые в другие окна, продолжали им пользоваться —
+    // use-after-free при закрытии исходного окна. Все настройки профиля
+    // выполняются ровно один раз — при первом создании; профиль живёт до
+    // конца процесса и никем не удаляется.
+    // ------------------------------------------------------------------
+    const bool profileFirstCreation = !s_sharedMainProfile;
+    if (profileFirstCreation) {
+        s_sharedMainProfile = new QWebEngineProfile("StormMainProfile");
+    }
+    m_mainProfile = s_sharedMainProfile;
 
+    if (profileFirstCreation) {
     m_mainProfile->settings()->setAttribute(QWebEngineSettings::PdfViewerEnabled, true);
     m_mainProfile->settings()->setAttribute(QWebEngineSettings::PluginsEnabled, true);
     m_mainProfile->settings()->setAttribute(QWebEngineSettings::LocalContentCanAccessFileUrls, true);
 
     m_mainProfile->setSpellCheckEnabled(true);
     m_mainProfile->setSpellCheckLanguages(QStringList() << "en-US" << "ru-RU");
-
-    qCritical().noquote() << "[DIAG] m_mainProfile isSpellCheckEnabled:" << m_mainProfile->isSpellCheckEnabled();
-    qCritical().noquote() << "[DIAG] m_mainProfile spellCheckLanguages:" << m_mainProfile->spellCheckLanguages();
+    }
 
     QPushButton* securityStatusBtn = new QPushButton(u8"🛡️ Storm Shield: Активен", this);
     securityStatusBtn->setObjectName("securityStatusBtn");
@@ -488,9 +584,9 @@ void MainWindow::setupUi(bool isDetached) {
     this->statusBar()->addPermanentWidget(securityStatusBtn);
 
     // =========================================================================
-    // --- ЯВНАЯ НАСТРОЙКА ОСНОВНОГО ПРОФИЛЯ ---
+    // --- ЯВНАЯ НАСТРОЙКА ОСНОВНОГО ПРОФИЛЯ (один раз, при первом создании) ---
     // =========================================================================
-    {
+    if (profileFirstCreation) {
         QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
         QString profilePath = appData + "/ProfileData";
         QDir().mkpath(profilePath + "/Cache");
@@ -500,15 +596,6 @@ void MainWindow::setupUi(bool isDetached) {
         m_mainProfile->setPersistentStoragePath(profilePath + "/Storage");
         m_mainProfile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
         m_mainProfile->cookieStore()->loadAllCookies();
-
-        // См. подробности у SettingsBridge::toggleClearSiteDataOnClose (SettingsBridge.h):
-        // сама очистка отложена до сюда, а не делается прямо в closeEvent(), потому
-        // что там нет гарантии, что событийный цикл доживёт до конца асинхронного
-        // перебора куки.
-        if (!isDetached && QSettings().value("session/pending_site_data_cleanup", false).toBool()) {
-            QSettings().remove("session/pending_site_data_cleanup");
-            runSiteDataCleanup(QSettings().value("browser/site_data_exceptions").toStringList());
-        }
 
         const QString stormUa = stormUserAgentFor(m_mainProfile);
         m_mainProfile->setHttpUserAgent(stormUa);
@@ -520,32 +607,43 @@ void MainWindow::setupUi(bool isDetached) {
         qWarning() << "[DIAG] Cookies policy:" << m_mainProfile->persistentCookiesPolicy();
     }
 
-    int initialBlockedCount = dbManager.getBlockedThreatsCount();
-    ShieldInterceptor* mainInterceptor = new ShieldInterceptor(this, initialBlockedCount);
-    mainInterceptor->setObjectName("ShieldInterceptor");
+    // См. подробности у SettingsBridge::toggleClearSiteDataOnClose (SettingsBridge.h):
+    // сама очистка отложена до сюда, а не делается прямо в closeEvent(), потому
+    // что там нет гарантии, что событийный цикл доживёт до конца асинхронного
+    // перебора куки.
+    if (!isDetached && QSettings().value("session/pending_site_data_cleanup", false).toBool()) {
+        QSettings().remove("session/pending_site_data_cleanup");
+        runSiteDataCleanup(QSettings().value("browser/site_data_exceptions").toStringList());
+    }
 
-    {
+    // Интерсепторы Shield живут вместе с ОБЩИМ профилем, а не с окном:
+    // раньше они были детьми окна, и при закрытии окна-создателя профиль
+    // продолжал пользоваться уже уничтоженным перехватчиком —
+    // use-after-free на каждом сетевом запросе.
+    if (profileFirstCreation) {
+        int initialBlockedCount = dbManager.getBlockedThreatsCount();
+        ShieldInterceptor* mainInterceptor = new ShieldInterceptor(m_mainProfile, initialBlockedCount);
+        mainInterceptor->setObjectName("ShieldInterceptor");
+
         QSettings shieldSettings;
         bool shieldEnabled = shieldSettings.value("shield/enabled", true).toBool();
         mainInterceptor->setEnabled(shieldEnabled);
-        updateShieldStatusIndicator(shieldEnabled);
-
         mainInterceptor->setExceptions(shieldSettings.value("shield/exceptions").toStringList());
-    }
 
-    m_mainProfile->setUrlRequestInterceptor(
-        new HttpsUpgradeInterceptor(mainInterceptor, QSettings().value("browser/https_only", false).toBool(), this));
+        m_mainProfile->setUrlRequestInterceptor(
+            new HttpsUpgradeInterceptor(mainInterceptor, QSettings().value("browser/https_only", false).toBool(), m_mainProfile));
 
-    AdblockManager::instance().init(m_mainProfile, nullptr);
+        AdblockManager::instance().init(m_mainProfile, nullptr);
 
-    applyMediaCodecFix(m_mainProfile);
-    applyGoogleLoginUaScript(m_mainProfile);
-    // =========================================================
-    // --- СТЕЛС-СКРИПТ ДЛЯ СКРЫТИЯ ВЕРХНЕЙ ПАНЕЛИ ПЕРЕВОДЧИКА ---
-    // =========================================================
-    QWebEngineScript hideBannerScript;
-    hideBannerScript.setName("HideTranslatorBanner");
-    QString hideJs = u8R"JS(
+        applyMediaCodecFix(m_mainProfile);
+        applyGoogleLoginUaScript(m_mainProfile);
+
+        // =========================================================
+        // --- СТЕЛС-СКРИПТ ДЛЯ СКРЫТИЯ ВЕРХНЕЙ ПАНЕЛИ ПЕРЕВОДЧИКА ---
+        // =========================================================
+        QWebEngineScript hideBannerScript;
+        hideBannerScript.setName("HideTranslatorBanner");
+        QString hideJs = u8R"JS(
         (function() {
             var host = window.location.hostname;
             if (host.includes('translate.goog') || host.includes('translate.google') || host.includes('translate.yandex')) {
@@ -567,23 +665,31 @@ void MainWindow::setupUi(bool isDetached) {
             }
         })();
     )JS";
-    hideBannerScript.setSourceCode(hideJs);
-    hideBannerScript.setInjectionPoint(QWebEngineScript::DocumentReady);
-    hideBannerScript.setWorldId(QWebEngineScript::MainWorld);
-    hideBannerScript.setRunsOnSubFrames(true);
-    m_mainProfile->scripts()->insert(hideBannerScript);
+        hideBannerScript.setSourceCode(hideJs);
+        hideBannerScript.setInjectionPoint(QWebEngineScript::DocumentReady);
+        hideBannerScript.setWorldId(QWebEngineScript::MainWorld);
+        hideBannerScript.setRunsOnSubFrames(true);
+        m_mainProfile->scripts()->insert(hideBannerScript);
 
-    connect(mainInterceptor, &ShieldInterceptor::blockedCountChanged, this, [this, securityStatusBtn](int total) {
-        QMetaObject::invokeMethod(this, [this, securityStatusBtn, total]() {
-            dbManager.setBlockedThreatsCount(total);
+        // Сигнал счётчика заблокированных угроз подключается один раз — к окну,
+        // создавшему профиль. Для откреплённых окон индикатор остаётся
+        // статичным — незначительная плата за общий профиль (как в Chrome:
+        // щит глобален, а не на каждое окно).
+        connect(mainInterceptor, &ShieldInterceptor::blockedCountChanged, this, [this, securityStatusBtn](int total) {
+            QMetaObject::invokeMethod(this, [this, securityStatusBtn, total]() {
+                dbManager.setBlockedThreatsCount(total);
 
-            securityStatusBtn->setText(QString(u8"🛑 Заблокировано угроз: %1").arg(total));
-            securityStatusBtn->setStyleSheet(
-                "QPushButton { background-color: rgba(255, 95, 95, 0.1); color: #ff5f5f; border: 1px solid rgba(255, 95, 95, 0.3); border-radius: 6px; padding: 4px 12px; font-size: 12px; font-weight: bold; margin-right: 15px; }"
-                "QPushButton:hover { background-color: rgba(255, 95, 95, 0.2); }"
-            );
-            }, Qt::QueuedConnection);
-        });
+                securityStatusBtn->setText(QString(u8"🛑 Заблокировано угроз: %1").arg(total));
+                securityStatusBtn->setStyleSheet(
+                    "QPushButton { background-color: rgba(255, 95, 95, 0.1); color: #ff5f5f; border: 1px solid rgba(255, 95, 95, 0.3); border-radius: 6px; padding: 4px 12px; font-size: 12px; font-weight: bold; margin-right: 15px; }"
+                    "QPushButton:hover { background-color: rgba(255, 95, 95, 0.2); }"
+                );
+                }, Qt::QueuedConnection);
+            });
+    }
+
+    // Индикатор Shield каждого окна синхронизируется с настройкой при старте.
+    updateShieldStatusIndicator(QSettings().value("shield/enabled", true).toBool());
 
     QVBoxLayout* mainLayout = new QVBoxLayout(centralWidget);
     mainLayout->setContentsMargins(0, 0, 0, 0);
@@ -627,7 +733,64 @@ void MainWindow::setupUi(bool isDetached) {
     connect(tabWidget->tabBar(), &QTabBar::customContextMenuRequested,
         this, &MainWindow::showTabContextMenu);
     tabWidget->tabBar()->installEventFilter(new TabHoverFilter(tabWidget, this));
-    tabWidget->tabBar()->installEventFilter(new TabDragDropFilter(this, tabWidget));
+    // Фильтр перетаскивания сохраняем в m_tabDragFilter: он ставится не
+    // только на полосу вкладок, но и на каждый BrowserWebView (wireTab),
+    // чтобы вкладку, перетащенную из другого окна, можно было бросить в
+    // любую точку окна, а не точно в полоску вкладок.
+    m_tabDragFilter = new TabDragDropFilter(this, tabWidget);
+    tabWidget->tabBar()->installEventFilter(m_tabDragFilter);
+
+    // Кнопка «☰ N ▾» в правом углу полосы вкладок — выпадающий список
+    // всех открытых вкладок со счётчиком. Раньше единственным способом
+    // увидеть не влезшие вкладки были штатные кнопки прокрутки QTabBar —
+    // две крошечные серые стрелки, сливавшиеся с фоном (пользователи
+    // принимали их за баг и не понимали, что это кнопки).
+    m_tabsListBtn = new QToolButton(tabWidget);
+    m_tabsListBtn->setText(u8"☰ 0 ▾");
+    m_tabsListBtn->setToolTip(u8"Все открытые вкладки");
+    m_tabsListBtn->setCursor(Qt::PointingHandCursor);
+    m_tabsListBtn->setPopupMode(QToolButton::InstantPopup);
+    m_tabsListBtn->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    {
+        QFont f = m_tabsListBtn->font();
+        f.setPointSize(10);
+        f.setBold(true);
+        m_tabsListBtn->setFont(f);
+    }
+    m_tabsListBtn->setStyleSheet(
+        QStringLiteral(
+            "QToolButton {"
+            "  background: #21262d; color: #c9d1d9;"
+            "  border: 1px solid #30363d; border-radius: 6px;"
+            "  padding: 3px 10px 2px 10px; margin: 4px 4px 0px 6px;"
+            "}"
+            "QToolButton:hover { background: #2d333b; border-color: #56d39b; color: #ffffff; }"
+            "QToolButton::menu-indicator { image: none; width: 0; }"
+            "QToolButton::menu-button { border: none; }"
+            "QMenu {"
+            "  background: #1c2128; color: #eef3ff;"
+            "  border: 1px solid #30363d; border-radius: 8px; padding: 6px;"
+            "}"
+            "QMenu::item { padding: 7px 26px 7px 14px; border-radius: 6px; }"
+            "QMenu::item:selected { background: rgba(86, 211, 155, 0.18); }"
+            "QMenu::item:disabled { color: #8b949e; }"
+            "QMenu::separator { height: 1px; background: #30363d; margin: 5px 8px; }"
+        ));
+    {
+        QMenu* tabsMenu = new QMenu(m_tabsListBtn);
+        connect(tabsMenu, &QMenu::aboutToShow, this, [this, tabsMenu]() {
+            rebuildTabsMenu(tabsMenu);
+        });
+        m_tabsListBtn->setMenu(tabsMenu);
+    }
+    tabWidget->setCornerWidget(m_tabsListBtn, Qt::TopRightCorner);
+    // v1.2.9 «Баги»: corner-механизм Qt в этой конфигурации опускает
+    // кнопку «☰ N ▾» на строку вкладок ниже (см. TabsListButtonGeometryFilter
+    // выше) — фильтр возвращает её в центр полосы при каждом перемещении;
+    // X и зарезервированное место остаются от Qt.
+    m_tabsListBtn->installEventFilter(
+        new TabsListButtonGeometryFilter(tabWidget, this));
+    updateTabsListButton();
 
     connect(tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
         if (index >= 0) {
@@ -676,18 +839,44 @@ void MainWindow::setupUi(bool isDetached) {
         addNewTab(QUrl("storm://downloads"));
         });
 
-    connect(m_mainProfile, &QWebEngineProfile::downloadRequested, this, [this](QWebEngineDownloadRequest* request) {
-        downloadManager->addDownload(request);
-        });
+    // Загрузки направляются в менеджер ТОЛЬКО главного окна: профиль теперь
+    // общий, и подключение из каждого окна приводило бы к тому, что один и
+    // тот же QWebEngineDownloadRequest принимали бы сразу несколько
+    // менеджеров. Главное окно живёт до конца процесса (объект в main() на
+    // стеке), поэтому обработчик не пропадает, пока открыто хоть одно окно.
+    if (!isDetached) {
+        connect(m_mainProfile, &QWebEngineProfile::downloadRequested, this, [this](QWebEngineDownloadRequest* request) {
+            downloadManager->addDownload(request);
+            });
+    }
 
     mainLayout->addWidget(workArea, 1);
 
     AIAssistantWidget* aiWidget = new AIAssistantWidget(this);
     aiAssistantWidget = aiWidget;
     sidebar->addItem(u8"🧠", u8"Storm AI", aiWidget);
+    // Действие из контекстного меню страницы («переведи/объясни выделенное»)
+    // эмитит panelActivationRequested — раньше сигнал никуда не был подключён,
+    // и ответ ИИ уходил в скрытую панель: выглядело как «ничего не работает».
+    // Теперь панель сайдбара сама раскрывается и поднимает вкладку Storm AI.
+    connect(aiWidget, &AIAssistantWidget::panelActivationRequested, this, [this]() {
+        if (sidebar) {
+            sidebar->show();
+            sidebar->openItem(aiAssistantWidget);
+        }
+        });
 
     NotesWidget* notesWidget = new NotesWidget(this);
     sidebar->addItem(u8"📝", u8"Заметки", notesWidget);
+    // v1.2.9 «Заметки по сайтам»: панель следит за активной вкладкой ЭТОГО
+    // окна (каждое своё — у откреплённых окон свои вкладки) и показывает
+    // домен, к которому можно привязать заметку. Внутренние storm://-страницы
+    // фильтруются внутри NotesWidget::domainFromUrl().
+    connect(tabWidget, &QTabWidget::currentChanged, this, [this, notesWidget](int idx) {
+        if (auto* v = qobject_cast<QWebEngineView*>(tabWidget->widget(idx))) {
+            notesWidget->updateCurrentSite(v->url());
+        }
+        });
 
     TodoWidget* todoWidget = new TodoWidget(this);
     sidebar->addItem(u8"✅", u8"Задачи", todoWidget);
@@ -803,6 +992,14 @@ void MainWindow::setupUi(bool isDetached) {
     QShortcut* reopenClosedTabShortcut = new QShortcut(QKeySequence("Ctrl+Shift+T"), this);
     connect(reopenClosedTabShortcut, &QShortcut::activated, this, &MainWindow::reopenLastClosedTab);
 
+    // v1.2.9: быстрые сессии — те же сохранённые наборы вкладок, что в
+    // Закладки -> «💾 Сессии ▾», но одной комбинацией и без лишних кликов.
+    QShortcut* saveSessionShortcut = new QShortcut(QKeySequence("Ctrl+Alt+S"), this);
+    connect(saveSessionShortcut, &QShortcut::activated, this, &MainWindow::quickSaveSession);
+
+    QShortcut* restoreSessionShortcut = new QShortcut(QKeySequence("Ctrl+Alt+R"), this);
+    connect(restoreSessionShortcut, &QShortcut::activated, this, &MainWindow::quickRestoreLastSession);
+
     auto focusAddressBar = [this]() {
         topBar->getAddressBar()->setFocus();
         topBar->getAddressBar()->selectAll();
@@ -859,8 +1056,12 @@ void MainWindow::setupUi(bool isDetached) {
         UpdateManager* autoUpdater = new UpdateManager(this);
         autoUpdater->setObjectName("UpdateManager");
 
-        connect(autoUpdater, &UpdateManager::updateStagedAndReady, this, [](const QString& ver) {
+        connect(autoUpdater, &UpdateManager::updateStagedAndReady, this, [this](const QString& ver) {
             qDebug() << "🔥 [Storm Updater] Обновление" << ver << "успешно скачано в фоне и ждет перезапуска!";
+            // Раньше пользователь вообще не узнавал, что обновление скачано и
+            // установится при закрытии браузера.
+            showTrayNotification(u8"Storm Browser",
+                QString(u8"Обновление %1 скачано и будет установлено при закрытии браузера.").arg(ver));
             });
 
         autoUpdater->startPeriodicChecks();

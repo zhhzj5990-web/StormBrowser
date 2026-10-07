@@ -160,6 +160,7 @@ void NewsWidget::loadNews() {
 
     QNetworkRequest request((QUrl(url)));
     request.setHeader(QNetworkRequest::UserAgentHeader, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StormBrowser/1.0");
+    request.setTransferTimeout(15 * 1000); // P2-3: RSS-источник без ответа не висит вечно
     currentReply = networkManager->get(request);
 }
 

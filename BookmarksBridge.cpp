@@ -14,6 +14,9 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonDocument>
+#include <QDateTime>
+#include <QTabWidget>
+#include <QWebEngineView>
 
 namespace {
 
@@ -32,6 +35,17 @@ namespace {
             "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
             "  name TEXT NOT NULL UNIQUE,"
             "  sort_order INTEGER NOT NULL DEFAULT 0"
+            ")"
+        );
+        // Менеджер сессий (волна R5): снимки открытых вкладок основного окна.
+        // UNIQUE на name даёт "эффект транзакции" — повторное имя не создать,
+        // а INSERT просто вернёт false, что и станет текстом ошибки.
+        q.exec(
+            "CREATE TABLE IF NOT EXISTS saved_sessions ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  name TEXT NOT NULL UNIQUE,"
+            "  created_at INTEGER NOT NULL,"
+            "  tabs_json TEXT NOT NULL"
             ")"
         );
     }
@@ -336,4 +350,231 @@ QString BookmarksBridge::moveBookmarkUp(const QString& url)
 QString BookmarksBridge::moveBookmarkDown(const QString& url)
 {
     return swapWithNeighbor(url, false);
+}
+
+// ============================ Менеджер сессий ============================
+
+QString BookmarksBridge::getSessions()
+{
+    QJsonArray arr;
+    QSqlQuery query;
+    query.exec("SELECT id, name, created_at, tabs_json FROM saved_sessions ORDER BY created_at DESC, id DESC");
+    while (query.next()) {
+        QJsonObject obj;
+        obj["id"] = query.value(0).toInt();
+        obj["name"] = query.value(1).toString();
+        const qint64 ts = query.value(2).toLongLong();
+        obj["createdText"] = QDateTime::fromMSecsSinceEpoch(ts).toString(QStringLiteral("dd.MM.yyyy HH:mm"));
+        obj["tabCount"] = QJsonDocument::fromJson(query.value(3).toByteArray()).array().size();
+        arr.append(obj);
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+QString BookmarksBridge::saveCurrentSession(const QString& name)
+{
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty()) return u8"Название сессии не может быть пустым.";
+
+    QTabWidget* tabs = m_mw->getTabWidget();
+    if (!tabs || tabs->count() == 0) return u8"Нет открытых вкладок для сохранения.";
+
+    // Пустые вкладки (newtab/about:blank) в сессию не пишем — при
+    // восстановлении они не несут информации. Активную вкладку помечаем
+    // "active":true, чтобы restoreSession мог вернуть фокус на неё.
+    const int current = tabs->currentIndex();
+    bool activeSaved = false;
+    QJsonArray tabsArr;
+    for (int i = 0; i < tabs->count(); ++i) {
+        auto* view = qobject_cast<QWebEngineView*>(tabs->widget(i));
+        if (!view) continue;
+
+        const QString url = view->url().toString();
+        if (url.isEmpty() || url == QLatin1String("about:blank")
+            || url == QLatin1String("storm://newtab")) {
+            continue;
+        }
+
+        QJsonObject t;
+        t["title"] = view->title().isEmpty() ? url : view->title();
+        t["url"] = url;
+        // v1.2.9: закреплённые вкладки сохраняются с флагом — при
+        // восстановлении они снова встают компактными в начало полосы.
+        if (view->property("tabPinned").toBool()) {
+            t["pinned"] = true;
+        }
+        if (i == current) {
+            t["active"] = true;
+            activeSaved = true;
+        }
+        tabsArr.append(t);
+    }
+
+    if (tabsArr.isEmpty()) {
+        return u8"Сохранять нечего: во всех вкладках пустые страницы.";
+    }
+    // Активной была пустая вкладка — пометим первую сохранённую, чтобы после
+    // восстановления пользователь не остался на посторонней вкладке.
+    if (!activeSaved) {
+        QJsonObject first = tabsArr.at(0).toObject();
+        first["active"] = true;
+        tabsArr.replace(0, first);
+    }
+
+    QSqlQuery dup;
+    dup.prepare("SELECT id FROM saved_sessions WHERE name = :name");
+    dup.bindValue(":name", trimmed);
+    if (dup.exec() && dup.next()) {
+        return u8"Сессия с таким названием уже есть — придумайте другое имя.";
+    }
+
+    QSqlQuery insert;
+    insert.prepare(
+        "INSERT INTO saved_sessions (name, created_at, tabs_json) "
+        "VALUES (:name, :createdAt, :tabs)");
+    insert.bindValue(":name", trimmed);
+    insert.bindValue(":createdAt", QDateTime::currentMSecsSinceEpoch());
+    insert.bindValue(":tabs", QString::fromUtf8(QJsonDocument(tabsArr).toJson(QJsonDocument::Compact)));
+    if (!insert.exec()) return u8"Не удалось сохранить сессию (ошибка базы данных).";
+
+    return QString(); // успех
+}
+
+QString BookmarksBridge::restoreSession(int sessionId)
+{
+    QJsonObject result;
+    auto fail = [&result](const QString& msg) {
+        result["ok"] = false;
+        result["error"] = msg;
+        return QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact));
+    };
+
+    QTabWidget* tabs = m_mw->getTabWidget();
+    if (!tabs) return fail(u8"Окно браузера недоступно.");
+
+    QSqlQuery query;
+    query.prepare("SELECT tabs_json FROM saved_sessions WHERE id = :id");
+    query.bindValue(":id", sessionId);
+    if (!query.exec() || !query.next()) return fail(u8"Сессия не найдена (возможно, уже удалена).");
+
+    const QJsonArray tabsArr = QJsonDocument::fromJson(query.value(0).toByteArray()).array();
+    if (tabsArr.isEmpty()) return fail(u8"В этой сессии нет вкладок.");
+
+    // Восстановление ДОБАВЛЯЕТ вкладки к уже открытым (как «Открыть
+    // импортированные вкладки»), ничего не закрывая — вдруг то, что открыто
+    // сейчас, тоже нужно. Лимит 20 — чтобы не задушить ОЗУ десятком тяжёлых
+    // сайтов, восстановленных одним кликом.
+    const int kMaxRestore = 20;
+    const int firstNewIndex = tabs->count();
+    int opened = 0;
+    int activeIndex = -1;
+    bool limited = false;
+
+    for (const auto& v : tabsArr) {
+        if (opened >= kMaxRestore) { limited = true; break; }
+        const QJsonObject t = v.toObject();
+        const QString url = t.value("url").toString();
+        if (url.isEmpty()) continue;
+
+        m_mw->addNewTab(QUrl(url));
+        // v1.2.9: восстановление закреплённого состояния (текст вкладки
+        // гасится, ширина — компактная, см. MainWindow::setTabPinned).
+        if (t.value("pinned").toBool()) {
+            QTabWidget* tw = m_mw->getTabWidget();
+            if (QWidget* added = tw->widget(tw->count() - 1)) {
+                m_mw->setTabPinned(added, true);
+            }
+        }
+        if (t.value("active").toBool()) activeIndex = firstNewIndex + opened;
+        ++opened;
+    }
+
+    if (opened == 0) return fail(u8"В этой сессии нет вкладок.");
+
+    // addNewTab обычно делает вкладку текущей; после цикла явно возвращаем
+    // фокус на сохранённую активную (или на первую из восстановленных).
+    if (activeIndex < 0) activeIndex = firstNewIndex;
+    if (activeIndex >= tabs->count()) activeIndex = tabs->count() - 1;
+    tabs->setCurrentIndex(activeIndex);
+
+    result["ok"] = true;
+    result["opened"] = opened;
+    result["limited"] = limited;
+    return QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact));
+}
+
+// ---------------------------------------------------------------------
+// v1.2.9: быстрые операции для горячих клавиш Ctrl+Alt+S / Ctrl+Alt+R.
+// ---------------------------------------------------------------------
+QString BookmarksBridge::quickSaveCurrentSession(QString* nameOut) {
+    // База имени — как suggestSessionName() на странице закладок
+    // («Сессия от ДД.ММ ЧЧ:ММ»); при коллизии добавляем « (2)», « (3)»...
+    const QString base = QDateTime::currentDateTime().toString(u8"Сессия от dd.MM HH:mm");
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        const QString candidate = (attempt == 0)
+            ? base
+            : QString(u8"%1 (%2)").arg(base).arg(attempt + 1);
+        const QString err = saveCurrentSession(candidate);
+        if (err.isEmpty()) {
+            if (nameOut) *nameOut = candidate;
+            return QString(); // успех
+        }
+        // «уже есть» — пробуем следующий суффикс; любую другую причину
+        // (нет вкладок, ошибка БД) возвращаем сразу, там ретраи бессмысленны
+        if (!err.contains(u8"уже есть")) {
+            return err;
+        }
+    }
+    return u8"Не удалось подобрать свободное имя для сессии.";
+}
+
+QString BookmarksBridge::quickRestoreLatestSession(int* openedOut, QString* nameOut) {
+    QSqlQuery q;
+    q.prepare("SELECT id, name FROM saved_sessions ORDER BY created_at DESC, id DESC LIMIT 1");
+    if (!q.exec() || !q.next()) {
+        return u8"Сохранённых сессий пока нет — сначала сохраните одну (Ctrl+Alt+S).";
+    }
+    const int sessionId = q.value(0).toInt();
+    const QString name = q.value(1).toString();
+
+    const QString res = restoreSession(sessionId); // JSON {"ok":..,"opened":N}
+    const QJsonObject obj = QJsonDocument::fromJson(res.toUtf8()).object();
+    if (!obj.value("ok").toBool()) {
+        return obj.value("error").toString(u8"Не удалось восстановить сессию.");
+    }
+    if (openedOut) *openedOut = obj.value("opened").toInt();
+    if (nameOut) *nameOut = name;
+    return QString();
+}
+
+QString BookmarksBridge::deleteSession(int sessionId)
+{
+    QSqlQuery del;
+    del.prepare("DELETE FROM saved_sessions WHERE id = :id");
+    del.bindValue(":id", sessionId);
+    if (!del.exec() || del.numRowsAffected() == 0) {
+        return u8"Не удалось удалить сессию (возможно, её уже нет).";
+    }
+    return QString();
+}
+
+QString BookmarksBridge::renameSession(int sessionId, const QString& newName)
+{
+    const QString trimmed = newName.trimmed();
+    if (trimmed.isEmpty()) return u8"Название сессии не может быть пустым.";
+
+    QSqlQuery dup;
+    dup.prepare("SELECT id FROM saved_sessions WHERE name = :name AND id <> :id");
+    dup.bindValue(":name", trimmed);
+    dup.bindValue(":id", sessionId);
+    if (dup.exec() && dup.next()) return u8"Сессия с таким названием уже есть.";
+
+    QSqlQuery update;
+    update.prepare("UPDATE saved_sessions SET name = :name WHERE id = :id");
+    update.bindValue(":name", trimmed);
+    update.bindValue(":id", sessionId);
+    if (!update.exec() || update.numRowsAffected() == 0) {
+        return u8"Не удалось переименовать сессию (возможно, её уже нет).";
+    }
+    return QString();
 }

@@ -32,6 +32,27 @@ class MainWindow;
 // файле — код добавления не был под рукой), стоит проставлять
 // sort_order = MAX(sort_order)+1 в той же папке, иначе новые закладки будут
 // получать sort_order по умолчанию (0) и путаться в порядке с другими.
+// ДОБАВЛЕНО (волна R5 «Финал»): Менеджер сессий. Сессия — снимок вкладок
+// основного окна (заголовок + URL каждой вкладки, включая внутренние
+// storm://-страницы, кроме пустых newtab/about:blank, плюс отметка активной
+// вкладки). Хранится в таблице saved_sessions рядом с закладками. Управление —
+// со страницы storm://bookmarks (дропдаун «💾 Сессии» в тулбаре), потому что
+// сессии логичнее всего искать в разделе закладок: это «закладки на набор
+// вкладок целиком».
+//
+// Схема БД (миграция идемпотентна, см. ensureSchema() в .cpp):
+//   CREATE TABLE IF NOT EXISTS saved_sessions (
+//     id INTEGER PRIMARY KEY AUTOINCREMENT,
+//     name TEXT NOT NULL UNIQUE,
+//     created_at INTEGER NOT NULL,          -- мс с эпохи
+//     tabs_json TEXT NOT NULL);             -- [{"title":..,"url":..,"active"?:true}]
+//
+// Контракты ответов (та же конвенция, что у остальных методов):
+//   getSessions()            -> JSON-массив [{id,name,createdText,tabCount}]
+//   saveCurrentSession(name) -> "" при успехе, иначе текст ошибки
+//   restoreSession(id)       -> JSON {"ok":true,"opened":N,"limited":bool}
+//                               или   {"ok":false,"error":"..."}
+//   deleteSession(id) / renameSession(id, name) -> "" или текст ошибки
 class BookmarksBridge : public QObject {
     Q_OBJECT
 public:
@@ -77,6 +98,30 @@ public slots:
     // Точечная перестановка с соседом — для кнопок ⬆️/⬇️.
     QString moveBookmarkUp(const QString& url);
     QString moveBookmarkDown(const QString& url);
+
+    // --- Менеджер сессий (волна R5) ---
+    // Список сохранённых сессий, новые сверху. createdText уже отформатирован
+    // на стороне C++ ("dd.MM.yyyy HH:mm") — в JS остаётся только показать его.
+    QString getSessions();
+
+    // Снимает вкладки ОСНОВНОГО окна (откреплённые окна в сессию не входят —
+    // их можно вернуть в основное окно и сохранить вместе) и сохраняет под
+    // указанным именем. Имена уникальны.
+    QString saveCurrentSession(const QString& name);
+
+    // v1.2.9 — для горячих клавиш Ctrl+Alt+S / Ctrl+Alt+R (см. MainWindow):
+    // те же saved_sessions, но без UI — имя генерируем сами, дубликаты
+    // развязываем суффиксами. Возвращают "" при успехе, иначе текст ошибки.
+    // Успех: nameOut/openedOut заполнены.
+    QString quickSaveCurrentSession(QString* nameOut);
+    QString quickRestoreLatestSession(int* openedOut, QString* nameOut);
+
+    // Открывает все вкладки сессии (до 20 за раз — как «Открыть импортированные
+    // вкладки», чтобы не задушить ОЗУ) и восстанавливает активную вкладку.
+    QString restoreSession(int sessionId);
+
+    QString deleteSession(int sessionId);
+    QString renameSession(int sessionId, const QString& newName);
 
 private:
     MainWindow* m_mw;

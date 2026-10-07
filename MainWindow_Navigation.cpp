@@ -187,7 +187,12 @@ void MainWindow::goForward() {
 
 void MainWindow::reloadPage() {
     if (auto* view = qobject_cast<QWebEngineView*>(tabWidget->currentWidget())) {
-        view->reload();
+        // Внутренние страницы (storm-talk, storm://home, ...) не имеют реального
+        // сетевого адреса — их перезаливаем шаблоном, а не reload()'ом по фиктивному
+        // baseUrl (иначе F5 превращал вкладку в ошибку соединения).
+        if (!reloadInternalTab(view)) {
+            view->reload();
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QSettings>
 #include <QIcon>
+#include <QUrl>
 #include <QWebEngineUrlScheme>
 #include "MainWindow.h"
 #include "Logger.h"
@@ -11,6 +12,7 @@
 #include <QStandardPaths>
 #include <QProcess>
 #include "UpdateManager.h"
+#include "AnalyticsClient.h"
 
 int main(int argc, char* argv[])
 {
@@ -28,6 +30,38 @@ int main(int argc, char* argv[])
     // 3. Проверяем настройку аппаратного ускорения
     QSettings settings;
     bool useHwAccel = settings.value("browser/hw_accel", true).toBool();
+
+    // 3.2. БЕЗОПАСНЫЙ DNS (DNS-over-HTTPS) — Настройки → Конфиденциальность.
+    // Шифрованные DNS-запросы (DoH) скрывают посещаемые домены от провайдера
+    // и атакующих в локальной сети. Задаётся флагом Chromium ДО запуска
+    // движка, поэтому изменение настройки применяется после перезапуска.
+    // Формат — официально документированный способ включить DoH в Chromium:
+    //   --enable-features=DnsOverHttps<DoHTrial>SecuredFallbackOff/Templates<URL>
+    // где URL — percent-encoded адрес DoH-сервера. SecuredFallbackOff запрещает
+    // тихий откат на обычный (незашифрованный) DNS, если DoH-сервер не ответил.
+    QString dohFlag;
+    if (settings.value("browser/secure_dns_enabled", false).toBool()) {
+        const QString provider = settings.value("browser/secure_dns_provider", QStringLiteral("yandex")).toString();
+        QString dohUrl;
+        if (provider == QLatin1String("yandex")) dohUrl = QStringLiteral("https://dns.yandex.com/dns-query");
+        else if (provider == QLatin1String("google")) dohUrl = QStringLiteral("https://dns.google/dns-query");
+        else if (provider == QLatin1String("cloudflare")) dohUrl = QStringLiteral("https://cloudflare-dns.com/dns-query");
+        else if (provider == QLatin1String("cloudflare_family")) dohUrl = QStringLiteral("https://family.cloudflare-dns.com/dns-query");
+        else if (provider == QLatin1String("adguard")) dohUrl = QStringLiteral("https://dns.adguard-dns.com/dns-query");
+        else if (provider == QLatin1String("adguard_family")) dohUrl = QStringLiteral("https://family.adguard-dns.com/dns-query");
+        else if (provider == QLatin1String("quad9")) dohUrl = QStringLiteral("https://dns.quad9.net/dns-query");
+        else if (provider == QLatin1String("custom")) dohUrl = settings.value("browser/secure_dns_custom_url").toString().trimmed();
+
+        // Свой сервер обязан быть https:// — незащищённый DoH не имеет смысла,
+        // а http:// Chromium для DoH не примет.
+        if (dohUrl.startsWith(QLatin1String("https://")) && dohUrl.length() > 12) {
+            dohFlag = " --enable-features=DnsOverHttps<DoHTrial>SecuredFallbackOff/Templates"
+                + QString::fromUtf8(QUrl::toPercentEncoding(dohUrl));
+        }
+        else {
+            qWarning() << "[SecureDNS] Провайдер" << provider << "не даёт валидного https-адреса — DoH не включаю.";
+        }
+    }
 
     // =================================================================
     // 3.1. SAFE-MODE / crash-guard.
@@ -74,6 +108,17 @@ int main(int argc, char* argv[])
     // остальные сайты видят обычный Chrome-UA — это нормальная ситуация.
     QString originClusterFix = "OriginAgentClusterDefaultEnable,UserAgentClientHint";
 
+    // De-Google / стабильность — общие флаги ОБЕИХ веток рендеринга:
+    //  - --disable-background-networking: гасит ФОНОВЫЕ сервисные запросы
+    //    движка (variations, component updater, SafeBrowsing-обновления).
+    //    НЕ трогает сеть страниц: сайты, YouTube, DoH работают как раньше;
+    //  - --disable-component-update: запрет докачки компонентов по сети;
+    //  - --js-flags=--max-old-space-size=2048: жёсткий потолок кучи V8
+    //    (2 ГБ на процесс-рендерер) — «распухшая» вкладка умирает по memory
+    //    guard сама, а не съедает всю ОЗУ и не валит весь браузер.
+    QString deGoogleFlags = "--disable-background-networking --disable-component-update "
+                            "--js-flags=--max-old-space-size=2048 ";
+
     if (!useHwAccel) {
         // Полный программный путь рендеринга: --disable-gpu только выключает
         // GPU-процесс, но композитинг и растеризация могут всё равно
@@ -83,13 +128,27 @@ int main(int argc, char* argv[])
         // требует вообще никакого видеодрайвера и работает даже на ПК с
         // полностью отсутствующим/сломанным GPU-драйвером.
         qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
-            (baseFlags +
+            (baseFlags + deGoogleFlags +
                 "--disable-gpu --disable-gpu-compositing --disable-gpu-rasterization "
-                "--use-angle=d3d11warp --disable-features=" + originClusterFix).toUtf8());
+                "--use-angle=d3d11warp --disable-features=" + originClusterFix + dohFlag).toUtf8());
     }
     else {
+        // Аппаратный путь — стабилизируем GPU без потери скорости:
+        //  - --use-angle=d3d11: прибиваем ANGLE к самому стабильному бэкенду
+        //    Windows (D3D11) вместо авто-выбора, который на части драйверов
+        //    цепляется за Vulkan/GL и падает. YouTube/видео работают как обычно;
+        //  - --disable-features=CanvasOopRasterization: выключает
+        //    экспериментальный out-of-process растеризатор Canvas — один из
+        //    главных источников падений GPU-процесса на нестандартных драйверах;
+        //  - --disable-zero-copy: более консервативный путь растеризации
+        //    (на новых версиях движка может быть no-op — оставлен для старых
+        //    веток Qt, где переключатель ещё живой);
+        //  - AV1Decoder по-прежнему выключен: YouTube отдаёт те же ролики в
+        //    VP9/H.264 без потери качества, а аппаратный AV1 слабее поддерживается.
         qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
-            (baseFlags + "--disable-features=AV1Decoder," + originClusterFix).toUtf8());
+            (baseFlags + deGoogleFlags +
+                "--use-angle=d3d11 --disable-zero-copy "
+                "--disable-features=CanvasOopRasterization,AV1Decoder," + originClusterFix + dohFlag).toUtf8());
     }
 
     // =================================================================
@@ -141,6 +200,11 @@ int main(int argc, char* argv[])
 
     // Только теперь, когда точно известно, что это единственный/главный
     // процесс и мы дойдём до app.exec(), создаём маркер safe-mode.
+    //
+    // Здесь же — анонимная статистика (v1.2.9): только у главного процесса,
+    // второй запуск браузера (который лишь будит окно и выходит) ничего
+    // не отправляет, иначе одна машина считалась бы дважды. См. AnalyticsClient.h.
+    AnalyticsClient analytics;
     {
         QFile guardFile(guardPath);
         guardFile.open(QIODevice::WriteOnly);
